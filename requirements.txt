@@ -1,0 +1,14 @@
+accelerate
+datasets
+numpy
+pandas
+peft
+pot
+scikit-learn
+scipy
+sentence-transformers
+sentencepiece
+torch
+tqdm
+transformers
+safetensors
