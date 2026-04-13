@@ -1,5 +1,6 @@
 accelerate
 datasets
+lightning
 numpy
 pandas
 peft

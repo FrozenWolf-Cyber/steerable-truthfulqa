@@ -2,6 +2,7 @@
 Run probing-based baseline steering methods on TruthfulQA.
 
 Replicates the exact same pipeline as ODESteer's truthfulqa_generate.py:
+  - seed_everything(seed) before any work
   - 2-fold cross-validation (train on split 0, test on split 1, then swap)
   - Fit steering model on train-split activations
   - Generate answers to test-split questions with steering applied
@@ -11,10 +12,13 @@ Usage:
   # Run a single method:
   python run_baselines.py -m Llama3.1-8B-Base -l 13 --steer CAA --T 1.0
 
+  # ODESteer (matches hydra defaults):
+  python run_baselines.py -m Llama3.1-8B-Base -l 13 --steer ODESteer --T 5.0
+
   # Run all baselines:
   python run_baselines.py -m Llama3.1-8B-Base -l 13 --steer all
 
-  # Run all baselines + evaluate:
+  # Run + evaluate:
   python run_baselines.py -m Llama3.1-8B-Base -l 13 --steer all --evaluate
 """
 
@@ -24,10 +28,12 @@ import json
 from pathlib import Path
 
 import torch
+from lightning import seed_everything
 from transformers import GenerationConfig
 
 from config import (
     TRUTHFULQA_SYSTEM_PROMPT, DEFAULT_SEED, STEER_METHODS,
+    STEER_DEFAULT_KWARGS, build_steer_name,
 )
 from data_prep import load_questions, load_activations
 from lm import HuggingFaceLM, batch_chat
@@ -42,71 +48,90 @@ def run_single_method(
     T: float,
     batch_size: int,
     seed: int,
+    steer_model_kwargs: dict | None = None,
     pace_cfg: dict | None = None,
 ):
+    if steer_model_kwargs is None:
+        steer_model_kwargs = STEER_DEFAULT_KWARGS.get(steer_name, {})
+
     output_dir = RESULTS_DIR / "raw_outputs" / model_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    steer_label = f"{steer_name}-T{T}" if steer_name != "NoSteer" else "NoSteer"
+    steer_label = build_steer_name(steer_name, steer_model_kwargs, T)
     filename = f"{model_name}-l{layer_idx}-{steer_label}-TruthfulQA-seed{seed}.jsonl"
 
     if (output_dir / filename).exists():
-        print(f"Output exists: {filename} — skipping")
+        print(f"✓ Output file {filename} already exists. Skipping TruthfulQA generation.")
+        print("-" * 120)
         return output_dir / filename
 
-    all_prompts, all_outputs = [], []
-    print(f"\n{'='*80}")
-    print(f"Running {model_name} / {steer_label} on TruthfulQA (2-fold CV)")
-    print(f"{'='*80}")
+    try:
+        all_prompts, all_outputs = [], []
+        print(f"→ Running 2-fold cross-validation for {model_name}-{steer_label} on layer {layer_idx}")
 
-    for test_split in [0, 1]:
-        train_split = 1 - test_split
-        print(f"\nFold {test_split + 1}: train={train_split}, test={test_split}")
+        for test_split in [0, 1]:
+            train_split = 1 - test_split
 
-        gen_config = GenerationConfig(
-            max_new_tokens=50, do_sample=True, temperature=0.7,
-            top_p=0.9, repetition_penalty=1.1, seed=seed,
-        )
+            print(f"\n→ Fold {test_split + 1}: Training on split {train_split}, testing on split {test_split}")
+            print("→ Loading LLM & Fitting Steer Model ...")
 
-        model = HuggingFaceLM(
-            model_name, steer_name,
-            default_generation_config=gen_config,
-            steer_layer_idx=layer_idx,
-            device="auto", dtype=torch.float32,
-            pace_cfg=pace_cfg if steer_name == "PaCE" else None,
-        )
+            gen_config = GenerationConfig(
+                max_new_tokens=50, do_sample=True, temperature=0.7,
+                top_p=0.9, repetition_penalty=1.1, seed=seed,
+            )
 
-        if steer_name not in ("NoSteer", "PaCE"):
-            pos_train, neg_train = load_activations(model_name, layer_idx, train_split)
-            model.fit_steer_model(pos_train, neg_train)
+            model = HuggingFaceLM(
+                model_name, steer_name,
+                default_generation_config=gen_config,
+                steer_model_kwargs=steer_model_kwargs,
+                steer_layer_idx=layer_idx,
+                device="auto", dtype=torch.float32,
+                pace_cfg=pace_cfg if steer_name == "PaCE" else None,
+            )
 
-        questions = load_questions(test_split)
-        messages = [[
-            {"role": "system", "content": TRUTHFULQA_SYSTEM_PROMPT},
-            {"role": "user", "content": q},
-        ] for q in questions]
+            if steer_name not in ("NoSteer", "PaCE"):
+                pos_train, neg_train = load_activations(model_name, layer_idx, train_split)
+                model.fit_steer_model(pos_train, neg_train)
 
-        print(f"Generating {len(questions)} responses (T={T}) ...")
-        outputs = batch_chat(model, messages, T=T, batch_size=batch_size)
+            print(f"→ Loading test questions from split {test_split} ...")
+            questions = load_questions(test_split)
+            messages = [[
+                {"role": "system", "content": TRUTHFULQA_SYSTEM_PROMPT},
+                {"role": "user", "content": q},
+            ] for q in questions]
 
-        all_prompts.extend(questions)
-        all_outputs.extend(outputs)
+            print(f"→ Generating {len(questions)} responses with T={T} ...")
+            outputs = batch_chat(model, messages, T=T, batch_size=batch_size)
+            print(f"→ Generated {len(outputs)} outputs")
 
-        del model
-        gc.collect()
-        torch.cuda.empty_cache()
+            all_prompts.extend(questions)
+            all_outputs.extend(outputs)
 
-    with open(output_dir / filename, "w") as f:
-        for prompt, output in zip(all_prompts, all_outputs):
-            f.write(json.dumps({
-                "prompt": prompt,
-                "output": output,
-                "generator": f"{model_name}-{steer_label}",
-                "dataset": "TruthfulQA",
-                "T": T,
-            }) + "\n")
+            del model
+            gc.collect()
+            torch.cuda.empty_cache()
 
-    print(f"Saved {len(all_outputs)} outputs to {filename}")
+        print(f"\n→ Saving all outputs to {filename} ...")
+        with open(output_dir / filename, "w") as f:
+            for prompt, output in zip(all_prompts, all_outputs):
+                f.write(json.dumps({
+                    "prompt": prompt,
+                    "output": output,
+                    "generator": f"{model_name}-{steer_label}",
+                    "dataset": "TruthfulQA",
+                    "T": T,
+                }) + "\n")
+
+        print(f"✓ Completed {model_name}-{steer_label} on TruthfulQA")
+        print(f"  Total responses generated: {len(all_outputs)}")
+        print(f"  Configuration: T={T}")
+        print("-" * 120)
+
+    except Exception as e:
+        print(f"→ Error: {e}")
+        import traceback
+        traceback.print_exc()
+
     return output_dir / filename
 
 
@@ -140,6 +165,8 @@ def main():
     parser.add_argument("--pace_max_concepts", type=int, default=5000)
     parser.add_argument("--pace_alpha", type=float, default=1.0)
     args = parser.parse_args()
+
+    seed_everything(args.seed)
 
     methods = STEER_METHODS if args.steer == "all" else [args.steer]
 

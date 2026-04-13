@@ -4,12 +4,25 @@ No Hydra — plain Python dicts and constants.
 """
 
 MODEL_NAMES = {
-    "Llama3.1-8B-Base": "meta-llama/Llama-3.1-8B",
-    "Llama3-8B-Base": "meta-llama/Meta-Llama-3-8B",
+    "TinyLlama": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
     "Llama2-7B-Base": "meta-llama/Llama-2-7b-hf",
-    "Mistral-7B-Base": "mistralai/Mistral-7B-v0.3",
+    "Llama2-7B-Chat": "meta-llama/Llama-2-7b-chat-hf",
+    "Llama3-8B-Base": "meta-llama/Meta-Llama-3-8B",
+    "Llama3-8B-Instruct": "meta-llama/Meta-Llama-3-8B-Instruct",
+    "Llama3.1-8B-Base": "meta-llama/Llama-3.1-8B",
+    "Llama3.1-8B-Instruct": "meta-llama/Llama-3.1-8B-Instruct",
+    "Qwen2-7B-Base": "Qwen/Qwen2-7B",
     "Qwen2.5-7B-Base": "Qwen/Qwen2.5-7B",
+    "Qwen3-8B-Base": "Qwen/Qwen3-8B-Base",
     "Falcon-7B-Base": "tiiuae/falcon-7b",
+    "Phi3-7B-Instruct": "microsoft/Phi-3-small-8k-instruct",
+    "Pythia-7B-Base": "EleutherAI/pythia-6.9b",
+    "Gemma-7B-Base": "google/gemma-7b",
+    "Gemma2-9B-Base": "google/gemma-2-9b",
+    "Mistral-7B-Base": "mistralai/Mistral-7B-v0.3",
+    "Vicuna": "lmsys/vicuna-7b-v1.5",
+    "RawVicuna": "AlekseyKorshuk/vicuna-7b",
+    "Alpaca": "chavinlo/alpaca-native",
 }
 
 DEFAULT_MODEL = "Llama3.1-8B-Base"
@@ -54,6 +67,61 @@ DEFAULT_GENERATION_KWARGS = dict(
     top_p=0.9,
     repetition_penalty=1.1,
 )
+
+# Default kwargs for each steer method — matches ODESteer's hydra steer/*.yaml configs exactly.
+STEER_DEFAULT_KWARGS = {
+    "CAA": {},
+    "ITI": {},
+    "RepE": {},
+    "LinAcT": {},
+    "MiMiC": {},
+    "NoSteer": {},
+    "ODESteer": dict(
+        solver="euler", steps=10,
+        n_components=8000, degree=2, gamma=0.1, coef0=1.0, lin_clf_type="lr",
+    ),
+    "RFFODESteer": dict(
+        n_components=8000, sigma="median", lin_clf_type="lr",
+    ),
+    "StepODESteer": dict(
+        n_components=8000, degree=2, gamma=0.1, coef0=1.0, lin_clf_type="lr",
+    ),
+    "RFFStepODESteer": dict(
+        n_components=8000, sigma="median", lin_clf_type="lr",
+    ),
+}
+
+
+def build_steer_name(steer_type: str, kwargs: dict, T: float) -> str:
+    """Build the descriptive steer name matching ODESteer's hydra naming convention."""
+    if steer_type == "NoSteer":
+        return "NoSteer"
+    if steer_type == "ODESteer":
+        return (
+            f"ODESteer-{kwargs.get('solver', 'euler')}"
+            f"-steps{kwargs.get('steps', 10)}"
+            f"-nc{kwargs.get('n_components', 8000)}"
+            f"-degree{kwargs.get('degree', 2)}"
+            f"-gamma{kwargs.get('gamma', 0.1)}"
+            f"-coef0{kwargs.get('coef0', 1.0)}"
+            f"-{kwargs.get('lin_clf_type', 'lr')}"
+            f"-T{T}"
+        )
+    if steer_type == "StepODESteer":
+        return (
+            f"StepODESteer"
+            f"-nc{kwargs.get('n_components', 8000)}"
+            f"-degree{kwargs.get('degree', 2)}"
+            f"-gamma{kwargs.get('gamma', 0.1)}"
+            f"-coef0{kwargs.get('coef0', 1.0)}"
+            f"-{kwargs.get('lin_clf_type', 'lr')}"
+            f"-T{T}"
+        )
+    if steer_type == "PaCE":
+        alpha = kwargs.get("alpha", 1.0)
+        return f"PaCE-alpha{alpha}-T{T}"
+    return f"{steer_type}-T{T}"
+
 
 # Concepts for CBM training on TruthfulQA.
 # Positive (truthful) and negative (common-myth / hallucination) concepts.
@@ -103,7 +171,8 @@ TRUTHFULQA_CONCEPTS = [
 ]
 
 STEER_METHODS = [
-    "NoSteer", "CAA", "ITI", "RepE", "LinAcT", "MiMiC", "PaCE",
+    "NoSteer", "RepE", "ITI", "CAA", "MiMiC", "LinAcT",
+    "ODESteer", "StepODESteer", "PaCE",
 ]
 
 EVAL_COLUMNS = [
