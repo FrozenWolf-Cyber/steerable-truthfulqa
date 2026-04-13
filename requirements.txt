@@ -12,3 +12,4 @@ torch
 tqdm
 transformers
 safetensors
+tiktoken
