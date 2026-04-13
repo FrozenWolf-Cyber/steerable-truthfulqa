@@ -20,6 +20,13 @@ Usage:
 
   # Run + evaluate:
   python run_baselines.py -m Llama3.1-8B-Base -l 13 --steer all --evaluate
+
+  # Multiple seeds:
+  python run_baselines.py -m Llama3.1-8B-Base -l 13 --steer ODESteer --T 5.0 --seeds 42 123 456
+
+  # Use activations from the original ODESteer repo:
+  python run_baselines.py -m Llama3.1-8B-Base -l 13 --steer ODESteer --T 5.0 \\
+      --data-dir /path/to/odesteer/data/truthfulqa
 """
 
 import argparse
@@ -50,7 +57,13 @@ def run_single_method(
     seed: int,
     steer_model_kwargs: dict | None = None,
     pace_cfg: dict | None = None,
+    data_dir: Path | None = None,
 ):
+    # Re-seed at the start of each method so that running multiple methods
+    # sequentially (--steer all) gives the same result as running each one
+    # independently — matching the original Hydra-based script behaviour.
+    seed_everything(seed)
+
     if steer_model_kwargs is None:
         steer_model_kwargs = STEER_DEFAULT_KWARGS.get(steer_name, {})
 
@@ -90,11 +103,13 @@ def run_single_method(
             )
 
             if steer_name not in ("NoSteer", "PaCE"):
-                pos_train, neg_train = load_activations(model_name, layer_idx, train_split)
+                pos_train, neg_train = load_activations(
+                    model_name, layer_idx, train_split, data_dir=data_dir,
+                )
                 model.fit_steer_model(pos_train, neg_train)
 
             print(f"→ Loading test questions from split {test_split} ...")
-            questions = load_questions(test_split)
+            questions = load_questions(test_split, data_dir=data_dir)
             messages = [[
                 {"role": "system", "content": TRUTHFULQA_SYSTEM_PROMPT},
                 {"role": "user", "content": q},
@@ -155,10 +170,16 @@ def main():
     parser.add_argument("-l", "--layer_idx", type=int, default=13)
     parser.add_argument("-b", "--batch_size", type=int, default=10)
     parser.add_argument("-s", "--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument("--seeds", type=int, nargs="+", default=None,
+                        help="Run with multiple seeds (overrides --seed)")
     parser.add_argument("--steer", type=str, default="all",
                         help="Steering method name or 'all'. Choices: " + ", ".join(STEER_METHODS))
     parser.add_argument("--T", type=float, default=1.0, help="Steering strength T")
     parser.add_argument("--evaluate", action="store_true", help="Run evaluation after generation")
+    parser.add_argument("--data-dir", type=str, default=None,
+                        help="Path to truthfulqa data dir containing texts/ and activations/ "
+                             "(default: ./data/truthfulqa). Use this to point to the original "
+                             "ODESteer repo's data dir for exact reproducibility.")
 
     parser.add_argument("--pace_index_path", type=str, default="./pace_data/concept_index.txt")
     parser.add_argument("--pace_representation_path", type=str, default="./pace_data/concept/")
@@ -166,30 +187,32 @@ def main():
     parser.add_argument("--pace_alpha", type=float, default=1.0)
     args = parser.parse_args()
 
-    seed_everything(args.seed)
-
+    data_dir = Path(args.data_dir) if args.data_dir else None
+    seeds = args.seeds if args.seeds else [args.seed]
     methods = STEER_METHODS if args.steer == "all" else [args.steer]
 
-    for method in methods:
-        pace_cfg = build_pace_cfg(args.layer_idx, args) if method == "PaCE" else None
-        run_single_method(
-            model_name=args.model,
-            layer_idx=args.layer_idx,
-            steer_name=method,
-            T=args.T,
-            batch_size=args.batch_size,
-            seed=args.seed,
-            pace_cfg=pace_cfg,
-        )
+    for seed in seeds:
+        for method in methods:
+            pace_cfg = build_pace_cfg(args.layer_idx, args) if method == "PaCE" else None
+            run_single_method(
+                model_name=args.model,
+                layer_idx=args.layer_idx,
+                steer_name=method,
+                T=args.T,
+                batch_size=args.batch_size,
+                seed=seed,
+                pace_cfg=pace_cfg,
+                data_dir=data_dir,
+            )
 
-    if args.evaluate:
-        from evaluate import evaluate_outputs
-        raw_dir = RESULTS_DIR / "raw_outputs"
-        eval_path = (
-            RESULTS_DIR / "eval_results" / "stat_results"
-            / f"{args.model}-l{args.layer_idx}-TruthfulQA-seed{args.seed}.csv"
-        )
-        evaluate_outputs(raw_dir, eval_path, args.model, args.layer_idx, args.seed, args.batch_size, display=True)
+        if args.evaluate:
+            from evaluate import evaluate_outputs
+            raw_dir = RESULTS_DIR / "raw_outputs"
+            eval_path = (
+                RESULTS_DIR / "eval_results" / "stat_results"
+                / f"{args.model}-l{args.layer_idx}-TruthfulQA-seed{seed}.csv"
+            )
+            evaluate_outputs(raw_dir, eval_path, args.model, args.layer_idx, seed, args.batch_size, display=True)
 
 
 if __name__ == "__main__":

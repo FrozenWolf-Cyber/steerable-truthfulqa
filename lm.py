@@ -24,6 +24,9 @@ from config import MODEL_NAMES, DEFAULT_CHAT_TEMPLATE, DEFAULT_GENERATION_KWARGS
 from steer import get_steer_model
 from steer.pace import PaCESteerer
 
+def _is_base_model(name: str) -> bool:
+    return "Base" in name and "Qwen" not in name
+
 
 class HuggingFaceLM:
     def __init__(
@@ -41,6 +44,7 @@ class HuggingFaceLM:
             device = "auto" if torch.cuda.is_available() else "cpu"
         self.dtype = dtype
 
+        self.model_name = model_name
         full_name = MODEL_NAMES.get(model_name, model_name)
         self.model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
             full_name, device_map=device, torch_dtype=self.dtype,
@@ -52,7 +56,11 @@ class HuggingFaceLM:
         self.tokenizer.padding_side = "left"
         self.model.config.pad_token_id = self.model.config.eos_token_id
 
-        if self.tokenizer.chat_template is None:
+        # Always use the Q:/A: template for Base models to match the original
+        # ODESteer codebase.  Newer tokenizers may ship a built-in chat_template
+        # even for base checkpoints; overriding it keeps the prompt format
+        # consistent with how the activations were extracted.
+        if _is_base_model(model_name) or self.tokenizer.chat_template is None:
             self.tokenizer.chat_template = DEFAULT_CHAT_TEMPLATE
 
         if default_generation_config is None:

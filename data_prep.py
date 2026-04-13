@@ -38,13 +38,15 @@ def format_dataset():
         print(f"Split {split_idx}: {len(pos_pairs)} pos, {len(neg_pairs)} neg pairs")
 
 
-def load_questions(split_idx: int) -> list[str]:
-    df = pd.read_json(TEXTS_DIR / f"pos_{split_idx}.jsonl", lines=True, orient="records")
+def load_questions(split_idx: int, data_dir: Path | None = None) -> list[str]:
+    texts_dir = (data_dir / "texts") if data_dir else TEXTS_DIR
+    df = pd.read_json(texts_dir / f"pos_{split_idx}.jsonl", lines=True, orient="records")
     return df["question"].unique().tolist()
 
 
-def load_activations(model_name: str, layer_idx: int, split_idx: int):
-    act_dir = DATA_DIR / "activations" / model_name
+def load_activations(model_name: str, layer_idx: int, split_idx: int,
+                     data_dir: Path | None = None):
+    act_dir = ((data_dir or DATA_DIR) / "activations" / model_name)
     pos = torch.load(act_dir / f"pos_{split_idx}_activations_layer{layer_idx}.pt", weights_only=True, map_location="cpu")
     neg = torch.load(act_dir / f"neg_{split_idx}_activations_layer{layer_idx}.pt", weights_only=True, map_location="cpu")
     return pos, neg

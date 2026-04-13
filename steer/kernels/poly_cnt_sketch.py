@@ -36,17 +36,18 @@ class PolyCntSketch(nn.Module):
         self.n_features_ = X.shape[0] if X.dim() == 1 else X.shape[1]
         n_features_ext = self._ext_feature_count()
 
-        # Indices: long; Signs: int8 in {-1, +1}
+        # Generate hash tables on CPU for determinism across GPU architectures,
+        # then move to the data device.
         indexHash = torch.randint(
             low = 0, high = self.n_components,
             size = (self.degree, n_features_ext),
-            dtype = torch.long, device = X.device,
-        )
+            dtype = torch.long, device = "cpu",
+        ).to(X.device)
         bitHash = (torch.randint(
             low = 0, high = 2,
             size = (self.degree, n_features_ext),
-            dtype = torch.int8, device = X.device,
-        ) * 2 - 1)  # -> {-1, +1} as int8
+            dtype = torch.int8, device = "cpu",
+        ) * 2 - 1).to(X.device)
         
         self.register_buffer("indexHash_", indexHash)
         self.register_buffer("bitHash_", bitHash)
@@ -331,7 +332,7 @@ class PolyCntSketch(nn.Module):
         # expand idx over batch and gather
         gathered = C.gather(2, idxF.unsqueeze(0).expand(B, -1, -1))  # [B, D, Forig]
         out = (gathered * bitsF.unsqueeze(0)).sum(dim=1)            # [B, Forig]
-        return out
+        return (self.gamma ** 0.5) * out
 
 
 
