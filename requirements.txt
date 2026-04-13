@@ -10,6 +10,7 @@ scipy
 sentence-transformers
 sentencepiece
 torch
+torchdiffeq
 tqdm
 transformers
 safetensors
