@@ -3,6 +3,7 @@ datasets
 numpy
 pandas
 peft
+protobuf
 pot
 scikit-learn
 scipy
