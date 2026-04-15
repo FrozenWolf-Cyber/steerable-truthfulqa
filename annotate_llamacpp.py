@@ -1,4 +1,5 @@
 import json
+import re
 import pickle
 import numpy as np
 from datasets import load_dataset
@@ -9,11 +10,10 @@ from llama_cpp import Llama
 # 1. Llama.cpp setup (A100)
 # =========================
 MODEL_REPO_ID = "unsloth/Qwen3.5-27B-GGUF"
-MODEL_FILENAME = "Q8_0/Qwen3.5-27B-Q8_0.gguf"
+MODEL_FILENAME = "Qwen3.5-27B-Q8_0.gguf"
 CHECKPOINT_PATH = "fever_progress_llamacpp.pkl"
 MAX_SAMPLES = 20000
 
-# On A100, -1 attempts to offload all layers to GPU.
 llm = Llama.from_pretrained(
     repo_id=MODEL_REPO_ID,
     filename=MODEL_FILENAME,
@@ -120,14 +120,19 @@ ANSWER:
 # =========================
 # 5. Llama.cpp call
 # =========================
+_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+
 def call_model(prompt):
     response = llm.create_chat_completion(
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.0,
-        top_p=1.0,
-        max_tokens=256,
+        temperature=0.7,
+        top_p=0.8,
+        top_k=20,
+        min_p=0.0,
+        max_tokens=512,
     )
     text = response["choices"][0]["message"]["content"].strip()
+    text = _THINK_RE.sub("", text).strip()
     if not text:
         raise RuntimeError("Empty response text.")
     return text
