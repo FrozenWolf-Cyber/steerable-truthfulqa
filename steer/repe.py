@@ -16,9 +16,11 @@ class RepE(VecSteer):
 
     @torch.no_grad()
     def fit(self, pos_X: Tensor, neg_X: Tensor) -> "RepE":
-        n = min(len(pos_X), len(neg_X))
-        diff = (pos_X[:n] - neg_X[:n]).cpu().numpy()
-        self.pca.fit(diff)
+        if len(pos_X) != len(neg_X):
+            n_Xs = min(len(pos_X), len(neg_X))
+            pos_X, neg_X = pos_X[:n_Xs], neg_X[:n_Xs]
+        diff = (pos_X - neg_X).detach().cpu()
+        self.pca.fit(diff.numpy())
         self.steer_vec = torch.as_tensor(
             self.pca.components_[0], device=pos_X.device,
         )

@@ -24,9 +24,6 @@ from config import MODEL_NAMES, DEFAULT_CHAT_TEMPLATE, DEFAULT_GENERATION_KWARGS
 from steer import get_steer_model
 from steer.pace import PaCESteerer
 
-def _is_base_model(name: str) -> bool:
-    return "Base" in name and "Qwen" not in name
-
 
 class HuggingFaceLM:
     def __init__(
@@ -56,11 +53,9 @@ class HuggingFaceLM:
         self.tokenizer.padding_side = "left"
         self.model.config.pad_token_id = self.model.config.eos_token_id
 
-        # Always use the Q:/A: template for Base models to match the original
-        # ODESteer codebase.  Newer tokenizers may ship a built-in chat_template
-        # even for base checkpoints; overriding it keeps the prompt format
-        # consistent with how the activations were extracted.
-        if _is_base_model(model_name) or self.tokenizer.chat_template is None:
+        # Match odesteer HuggingFaceLM: only install the default template when the
+        # tokenizer does not provide one (pin HF/transformers for identical prompts).
+        if self.tokenizer.chat_template is None:
             self.tokenizer.chat_template = DEFAULT_CHAT_TEMPLATE
 
         if default_generation_config is None:
@@ -120,7 +115,10 @@ class HuggingFaceLM:
         steer_kwargs: dict = {},
     ) -> list[str]:
         formatted = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            continue_final_message=False,
         )
         return self.generate(formatted, generation_config, steer, steer_kwargs)
 
@@ -144,7 +142,10 @@ class HuggingFaceLM:
         self, messages: list[list[dict]], layer_idx: Optional[int] = None,
     ) -> Tensor:
         formatted = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False,
+            messages,
+            tokenize=False,
+            add_generation_prompt=False,
+            continue_final_message=False,
         )
         return self.extract_prompt_eos_activations(formatted, layer_idx)
 
@@ -208,7 +209,7 @@ def batch_chat(
 ) -> list[str]:
     num_batches = (len(messages) + batch_size - 1) // batch_size
     outputs = []
-    for i in trange(num_batches, desc="Generating"):
+    for i in trange(num_batches):
         start = i * batch_size
         end = min((i + 1) * batch_size, len(messages))
         steer = model.steer_model is not None

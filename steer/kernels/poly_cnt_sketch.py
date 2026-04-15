@@ -36,18 +36,17 @@ class PolyCntSketch(nn.Module):
         self.n_features_ = X.shape[0] if X.dim() == 1 else X.shape[1]
         n_features_ext = self._ext_feature_count()
 
-        # Generate hash tables on CPU for determinism across GPU architectures,
-        # then move to the data device.
+        # Match odesteer: draw sketch hashes on the same device as X (Hydra parity).
         indexHash = torch.randint(
-            low = 0, high = self.n_components,
-            size = (self.degree, n_features_ext),
-            dtype = torch.long, device = "cpu",
-        ).to(X.device)
+            low=0, high=self.n_components,
+            size=(self.degree, n_features_ext),
+            dtype=torch.long, device=X.device,
+        )
         bitHash = (torch.randint(
-            low = 0, high = 2,
-            size = (self.degree, n_features_ext),
-            dtype = torch.int8, device = "cpu",
-        ) * 2 - 1).to(X.device)
+            low=0, high=2,
+            size=(self.degree, n_features_ext),
+            dtype=torch.int8, device=X.device,
+        ) * 2 - 1)
         
         self.register_buffer("indexHash_", indexHash)
         self.register_buffer("bitHash_", bitHash)
@@ -332,7 +331,8 @@ class PolyCntSketch(nn.Module):
         # expand idx over batch and gather
         gathered = C.gather(2, idxF.unsqueeze(0).expand(B, -1, -1))  # [B, D, Forig]
         out = (gathered * bitsF.unsqueeze(0)).sum(dim=1)            # [B, Forig]
-        return (self.gamma ** 0.5) * out
+        # Match odesteer _poly_cnt_sketch.py (batched path omits extra sqrt(gamma)).
+        return out
 
 
 

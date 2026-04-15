@@ -102,11 +102,12 @@ def run_single_method(
                 pace_cfg=pace_cfg if steer_name == "PaCE" else None,
             )
 
-            if steer_name not in ("NoSteer", "PaCE"):
-                pos_train, neg_train = load_activations(
-                    model_name, layer_idx, train_split, data_dir=data_dir,
-                )
-                model.fit_steer_model(pos_train, neg_train)
+            # Match truthfulqa_generate.py: always load train activations and call
+            # fit_steer_model (no-op for NoSteer / PaCE) so RNG and CUDA state match.
+            pos_train, neg_train = load_activations(
+                model_name, layer_idx, train_split, data_dir=data_dir,
+            )
+            model.fit_steer_model(pos_train, neg_train)
 
             print(f"→ Loading test questions from split {test_split} ...")
             questions = load_questions(test_split, data_dir=data_dir)
