@@ -1,8 +1,9 @@
 import json
+import os
 import re
 import pickle
+import urllib.request
 import numpy as np
-from datasets import load_dataset
 from tqdm import tqdm
 from llama_cpp import Llama
 
@@ -181,7 +182,17 @@ def to_vector(labels, concepts):
 # =========================
 # 8. Load FEVER + resume checkpoint
 # =========================
-dataset = load_dataset("fever", "v1.0", split=f"train[:{MAX_SAMPLES}]")
+FEVER_TRAIN_URL = "https://fever.ai/download/fever/train.jsonl"
+FEVER_LOCAL_PATH = "fever_train.jsonl"
+
+if not os.path.exists(FEVER_LOCAL_PATH):
+    print(f"Downloading FEVER training set from {FEVER_TRAIN_URL} ...")
+    urllib.request.urlretrieve(FEVER_TRAIN_URL, FEVER_LOCAL_PATH)
+    print("Download complete.")
+
+with open(FEVER_LOCAL_PATH) as f:
+    dataset = [json.loads(line) for line in f]
+dataset = dataset[:MAX_SAMPLES]
 
 all_vectors = []
 all_claims = []
@@ -208,7 +219,7 @@ logged_first_sample = False
 # =========================
 # 9. Annotation loop (checkpoint every response)
 # =========================
-for ex in tqdm(dataset.select(range(start_idx, len(dataset))), initial=start_idx, total=len(dataset)):
+for ex in tqdm(dataset[start_idx:], initial=start_idx, total=len(dataset)):
     claim = ex["claim"]
     label = normalize_label(ex["label"])
     concepts = get_concepts(label)
