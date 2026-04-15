@@ -4,6 +4,29 @@ PaCE — Parsimonious Concept Engineering (NeurIPS 2024).
 Adapted from ODESteer's pace.py with:
   - tqdm progress bar during initial concept embedding generation
   - No Hydra dependency — plain Python config dict
+
+How this file works
+-------------------
+1. **ConceptDictionary** — Reads PaCE-1M-style `concept_index.txt` and per-concept
+   `*.txt` files of short context strings that *illustrate* each concept.
+
+2. **ConceptPartitioner** — Splits concept indices into "benign" vs "undesirable"
+   (e.g. for TruthfulQA, keywords suggestive of falsehood → undesirable). Only
+   undesirable directions are removed at inference.
+
+3. **ActivationConceptEncoder** — For each concept, runs the frozen LM on its
+   context strings, takes the last-token hidden state at `layer_idx`, averages
+   across contexts, and caches a single **CPU** vector per concept (disk cache).
+
+4. **PaCESteerer** — Registers a **forward hook** on that transformer block. On
+   each forward, for every token position it expresses the hidden state as a
+   linear mix of concept vectors (`decompose_sparse`: SVD-reduced least squares),
+   rebuilds only the **undesirable** part of that mix, and **subtracts** it
+   (scaled by `alpha`) from the activation — suppressing those directions in
+   residual space.
+
+Dictionary math stays on **CPU** (NumPy `lstsq`); activations are moved CPU for
+the solve and moved back to the model device/dtype (see `_steer_activation`).
 """
 
 from __future__ import annotations
@@ -256,12 +279,18 @@ class PaCESteerer:
         if not self.concept_vectors:
             return activation
 
-        coeffs = decompose_sparse(target=activation, dictionary=self.concept_vectors, normalize=True)
-        correction = torch.zeros_like(activation)
+        dev, dtype = activation.device, activation.dtype
+        # Concept vectors and lstsq live on CPU; activations may be CUDA.
+        act_cpu = activation.detach().float().cpu()
+        coeffs = decompose_sparse(
+            target=act_cpu, dictionary=self.concept_vectors, normalize=True,
+        )
+        correction = torch.zeros_like(act_cpu)
         for idx in self.undesirable_idx:
             if idx < len(coeffs):
                 correction += coeffs[idx] * self.concept_vectors[idx]
-        return activation - self.alpha * correction
+        steered = act_cpu - self.alpha * correction
+        return steered.to(device=dev, dtype=dtype)
 
     def _hook_fn(self, module, input, output):
         if isinstance(output, tuple):
@@ -272,7 +301,7 @@ class PaCESteerer:
         steered = hidden.clone()
         for b in range(B):
             for t in range(T):
-                steered[b, t] = self._steer_activation(hidden[b, t].float()).to(hidden.dtype)
+                steered[b, t] = self._steer_activation(hidden[b, t])
         if isinstance(output, tuple):
             return (steered,) + output[1:]
         return steered
