@@ -16,4 +16,3 @@ tqdm
 transformers
 safetensors
 tiktoken
-pickle
