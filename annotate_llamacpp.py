@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import re
@@ -7,6 +8,19 @@ import numpy as np
 from tqdm import tqdm
 from llama_cpp import Llama
 
+
+def parse_args():
+    p = argparse.ArgumentParser(description="FEVER concept annotation with llama.cpp")
+    p.add_argument(
+        "--restart",
+        action="store_true",
+        help="Delete existing checkpoint pickle and start from scratch (does not delete fever_train.jsonl).",
+    )
+    return p.parse_args()
+
+
+ARGS = parse_args()
+
 # =========================
 # 1. Llama.cpp setup (A100)
 # =========================
@@ -14,6 +28,10 @@ MODEL_REPO_ID = "unsloth/Qwen3.5-27B-GGUF"
 MODEL_FILENAME = "Qwen3.5-27B-Q8_0.gguf"
 CHECKPOINT_PATH = "fever_progress_llamacpp.pkl"
 MAX_SAMPLES = 20000
+
+if ARGS.restart and os.path.isfile(CHECKPOINT_PATH):
+    os.remove(CHECKPOINT_PATH)
+    print(f"Removed checkpoint (--restart): {CHECKPOINT_PATH}")
 
 llm = Llama.from_pretrained(
     repo_id=MODEL_REPO_ID,
@@ -27,10 +45,6 @@ llm = Llama.from_pretrained(
 # =========================
 # 2. FEVER concept sets
 # =========================
-# IMPORTANT:
-# - Prompting uses a label-specific option set (conservative).
-# - Saved vectors are always over the *global* union concept set (fixed width).
-
 FEVER_CONCEPTS_ALL = [
     "claim directly supported by verifiable documented evidence",
     "claim with explicit attribution to a named source or study",
@@ -90,38 +104,37 @@ def get_concepts(label):
 
 
 # =========================
-# 4. Prompt builder (STRICT)
+# 4. Prompt builder (strict, machine-parseable last line)
 # =========================
 def build_prompt(claim, concepts):
-    return f"""
-You are a strict multi-label classifier.
+    opts_block = "\n".join(f"- {c}" for c in concepts)
+    return f"""You are a strict multi-label classifier for fact-checking concepts.
 
 TASK:
-Given a claim, select ALL applicable labels.
+Given the CLAIM below, select ALL applicable labels from OPTIONS.
 
-RULES:
-- Only choose from the provided options
-- Output ONLY a comma-separated list of labels
-- Do NOT explain anything
-- Do NOT add extra text
-- Multiple labels are allowed
-- Be precise and conservative
+OUTPUT RULES (mandatory):
+1. You may think step by step in earlier lines if needed.
+2. The VERY LAST non-empty line of your entire reply MUST be your only machine-readable answer.
+3. That final line MUST contain NOTHING except labels taken verbatim from OPTIONS (copy the full text exactly as written under OPTIONS).
+4. Separate multiple labels with a comma followed by a space: ", "
+5. Do NOT number labels, do NOT use "Option 1/2", do NOT add quotes, bullets, or extra words on that final line.
+6. Regex target: ^(<exact option text>(, <exact option text>)*)$
 
+OPTIONS:
+{opts_block}
 
 CLAIM:
 {claim}
 
-OPTIONS:
-{", ".join(concepts)}
-
-ANSWER:
-""".strip()
+End your reply so the last line is only comma-separated labels copied from OPTIONS.""".strip()
 
 
 # =========================
 # 5. Llama.cpp call
 # =========================
-_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+_THINK_RE = re.compile(r"<redacted_thinking>.*?</redacted_thinking>\s*", re.DOTALL)
+
 
 def call_model(prompt):
     response = llm.create_chat_completion(
@@ -132,23 +145,54 @@ def call_model(prompt):
         min_p=0.0,
         max_tokens=512,
     )
-    text = response["choices"][0]["message"]["content"].strip()
+    raw = response["choices"][0]["message"]["content"]
+    if raw is None:
+        raw = ""
+    raw = raw if isinstance(raw, str) else str(raw)
+    return raw
+
+
+def strip_thinking(text: str) -> str:
     text = _THINK_RE.sub("", text).strip()
-    if not text:
-        raise RuntimeError("Empty response text.")
     return text
 
 
+def last_non_empty_line(text: str) -> str:
+    body = strip_thinking(text)
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    return lines[-1] if lines else ""
+
+
 # =========================
-# 6. Safe parser
+# 6. Parser (last line only; regex-friendly)
 # =========================
 def parse_output(output, concepts):
-    output_lower = output.lower()
-    labels = []
+    last = last_non_empty_line(output)
+    if not last:
+        return [concepts[0]]
 
-    for c in concepts:
-        if c.lower() in output_lower:
-            labels.append(c)
+    parts = [p.strip() for p in last.split(",") if p.strip()]
+    labels = []
+    concept_set = {c: c for c in concepts}
+
+    for p in parts:
+        if p in concept_set:
+            labels.append(p)
+            continue
+        matched = None
+        for c in concepts:
+            if c.lower() == p.lower():
+                matched = c
+                break
+        if matched:
+            if matched not in labels:
+                labels.append(matched)
+            continue
+        for c in concepts:
+            if p.lower() in c.lower() or c.lower() in p.lower():
+                if c not in labels:
+                    labels.append(c)
+                break
 
     if len(labels) == 0:
         labels = [concepts[0]]
@@ -160,7 +204,6 @@ def parse_output(output, concepts):
 # 7. Convert to vector
 # =========================
 def to_vector(labels, concepts):
-    """Convert selected labels to a fixed-width vector over FEVER_CONCEPTS_ALL."""
     vec = np.zeros(len(FEVER_CONCEPTS_ALL), dtype=np.float32)
     selected = [c for c in labels if c in concepts]
     if len(selected) == 0:
@@ -177,6 +220,20 @@ def to_vector(labels, concepts):
     if s > 0:
         vec = vec / s
     return vec
+
+
+def log_sample(claim, prompt, raw_output, idx: int):
+    print("\n============")
+    print(f"sample_index={idx}")
+    print("[claim]")
+    print(claim)
+    print("------------")
+    print("[prompt]")
+    print(prompt)
+    print("------------")
+    print("[raw_model_output]")
+    print(raw_output)
+    print("============\n", flush=True)
 
 
 # =========================
@@ -197,7 +254,8 @@ dataset = dataset[:MAX_SAMPLES]
 all_vectors = []
 all_claims = []
 all_labels = []
-all_outputs = []
+all_prompts = []
+all_outputs_raw = []
 all_parse_errors = []
 
 try:
@@ -206,20 +264,23 @@ try:
     all_vectors = ckpt.get("all_vectors", [])
     all_claims = ckpt.get("all_claims", [])
     all_labels = ckpt.get("all_labels", [])
-    all_outputs = ckpt.get("all_outputs", [])
+    all_prompts = ckpt.get("all_prompts", [])
+    all_outputs_raw = ckpt.get("all_outputs_raw", ckpt.get("all_outputs", []))
     all_parse_errors = ckpt.get("all_parse_errors", [])
+    if len(all_prompts) < len(all_claims):
+        all_prompts = (all_prompts + [""] * len(all_claims))[: len(all_claims)]
     print(f"Resuming from checkpoint: {len(all_claims)} examples already processed")
 except FileNotFoundError:
     print("No checkpoint found. Starting fresh.")
 
 start_idx = len(all_claims)
-logged_first_sample = False
 
 
 # =========================
 # 9. Annotation loop (checkpoint every response)
 # =========================
-for ex in tqdm(dataset[start_idx:], initial=start_idx, total=len(dataset)):
+for i, ex in enumerate(tqdm(dataset[start_idx:], initial=start_idx, total=len(dataset))):
+    global_idx = start_idx + i
     claim = ex["claim"]
     label = normalize_label(ex["label"])
     concepts = get_concepts(label)
@@ -227,13 +288,15 @@ for ex in tqdm(dataset[start_idx:], initial=start_idx, total=len(dataset)):
     parse_error = ""
 
     try:
-        output = call_model(prompt)
+        raw_output = call_model(prompt)
     except Exception as e:
         print(f"[model-error] {type(e).__name__}: {str(e)[:200]}")
-        output = ""
+        raw_output = ""
+
+    log_sample(claim, prompt, raw_output, global_idx)
 
     try:
-        labels = parse_output(output, concepts)
+        labels = parse_output(raw_output, concepts)
         vec = to_vector(labels, concepts)
     except Exception as e:
         parse_error = f"{type(e).__name__}: {str(e)[:200]}"
@@ -241,17 +304,11 @@ for ex in tqdm(dataset[start_idx:], initial=start_idx, total=len(dataset)):
         labels = [concepts[0]]
         vec = to_vector(labels, concepts)
 
-    if not logged_first_sample:
-        print("\n[first-sample-prompt]")
-        print(prompt)
-        print("\n[first-sample-output]")
-        print(output)
-        logged_first_sample = True
-
     all_vectors.append(vec)
     all_claims.append(claim)
     all_labels.append(label)
-    all_outputs.append(output)
+    all_prompts.append(prompt)
+    all_outputs_raw.append(raw_output)
     all_parse_errors.append(parse_error)
 
     with open(CHECKPOINT_PATH, "wb") as f:
@@ -260,7 +317,8 @@ for ex in tqdm(dataset[start_idx:], initial=start_idx, total=len(dataset)):
                 "all_vectors": all_vectors,
                 "all_claims": all_claims,
                 "all_labels": all_labels,
-                "all_outputs": all_outputs,
+                "all_prompts": all_prompts,
+                "all_outputs_raw": all_outputs_raw,
                 "all_parse_errors": all_parse_errors,
             },
             f,
@@ -270,19 +328,22 @@ for ex in tqdm(dataset[start_idx:], initial=start_idx, total=len(dataset)):
 # =========================
 # 10. Save outputs
 # =========================
-np.save("fever_concept_vectors_llamacpp.npy", np.stack(all_vectors, axis=0))
-np.save("fever_claims_llamacpp.npy", np.array(all_claims))
+if len(all_vectors):
+    np.save("fever_concept_vectors_llamacpp.npy", np.stack(all_vectors, axis=0))
+    np.save("fever_claims_llamacpp.npy", np.array(all_claims))
+else:
+    print("No vectors to save (empty run).")
+
+payload = {
+    "claims": all_claims,
+    "fever_labels": all_labels,
+    "prompts": all_prompts,
+    "outputs_raw": all_outputs_raw,
+    "parse_errors": all_parse_errors,
+}
 
 with open("fever_raw_outputs_llamacpp.json", "w") as f:
-    json.dump(
-        {
-            "claims": all_claims,
-            "fever_labels": all_labels,
-            "outputs": all_outputs,
-            "parse_errors": all_parse_errors,
-        },
-        f,
-    )
+    json.dump(payload, f, ensure_ascii=False)
 
 print("DONE")
 print(
