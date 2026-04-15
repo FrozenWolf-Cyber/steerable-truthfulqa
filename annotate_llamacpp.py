@@ -9,7 +9,7 @@ from llama_cpp import Llama
 # 1. Llama.cpp setup (A100)
 # =========================
 MODEL_REPO_ID = "unsloth/Qwen3.5-27B-GGUF"
-MODEL_FILENAME = "BF16/Qwen3.5-27B-BF16-00001-of-00002.gguf"
+MODEL_FILENAME = "Q8_0/Qwen3.5-27B-Q8_0.gguf"
 CHECKPOINT_PATH = "fever_progress_llamacpp.pkl"
 MAX_SAMPLES = 20000
 
@@ -24,26 +24,41 @@ llm = Llama.from_pretrained(
 
 
 # =========================
-# 2. Concept sets
+# 2. FEVER concept sets
 # =========================
-SUPPORTS_CONCEPTS = [
+# IMPORTANT:
+# - Prompting uses a label-specific option set (conservative).
+# - Saved vectors are always over the *global* union concept set (fixed width).
+
+FEVER_CONCEPTS_ALL = [
     "claim directly supported by verifiable documented evidence",
     "claim with explicit attribution to a named source or study",
     "claim asserting certainty on a contested or ambiguous question",
-]
-
-REFUTES_CONCEPTS = [
     "claim reflecting a widespread popular myth or misconception",
     "claim that contradicts established scientific or historical consensus",
     "claim generalized from anecdotal or single-case evidence",
-    "claim asserting certainty on a contested or ambiguous question",
+    "claim presented as fact but lacking sufficient evidential basis",
+    "claim under genuine empirical uncertainty with appropriate hedging",
+]
+
+SUPPORTS_CONCEPTS = [
+    FEVER_CONCEPTS_ALL[0],
+    FEVER_CONCEPTS_ALL[1],
+    FEVER_CONCEPTS_ALL[2],
+]
+
+REFUTES_CONCEPTS = [
+    FEVER_CONCEPTS_ALL[3],
+    FEVER_CONCEPTS_ALL[4],
+    FEVER_CONCEPTS_ALL[5],
+    FEVER_CONCEPTS_ALL[2],
 ]
 
 NEI_CONCEPTS = [
-    "claim generalized from anecdotal or single-case evidence",
-    "claim presented as fact but lacking sufficient evidential basis",
-    "claim under genuine empirical uncertainty with appropriate hedging",
-    "claim asserting certainty on a contested or ambiguous question",
+    FEVER_CONCEPTS_ALL[5],
+    FEVER_CONCEPTS_ALL[6],
+    FEVER_CONCEPTS_ALL[7],
+    FEVER_CONCEPTS_ALL[2],
 ]
 
 
@@ -139,13 +154,22 @@ def parse_output(output, concepts):
 # 7. Convert to vector
 # =========================
 def to_vector(labels, concepts):
-    vec = np.zeros(len(concepts), dtype=np.float32)
-    for i, c in enumerate(concepts):
-        if c in labels:
-            vec[i] = 1.0
+    """Convert selected labels to a fixed-width vector over FEVER_CONCEPTS_ALL."""
+    vec = np.zeros(len(FEVER_CONCEPTS_ALL), dtype=np.float32)
+    selected = [c for c in labels if c in concepts]
+    if len(selected) == 0:
+        selected = [concepts[0]]
 
-    if vec.sum() > 0:
-        vec = vec / vec.sum()
+    for c in selected:
+        try:
+            idx = FEVER_CONCEPTS_ALL.index(c)
+        except ValueError:
+            continue
+        vec[idx] = 1.0
+
+    s = float(vec.sum())
+    if s > 0:
+        vec = vec / s
     return vec
 
 
@@ -230,7 +254,7 @@ for ex in tqdm(dataset.select(range(start_idx, len(dataset))), initial=start_idx
 # =========================
 # 10. Save outputs
 # =========================
-np.save("fever_concept_vectors_llamacpp.npy", np.array(all_vectors))
+np.save("fever_concept_vectors_llamacpp.npy", np.stack(all_vectors, axis=0))
 np.save("fever_claims_llamacpp.npy", np.array(all_claims))
 
 with open("fever_raw_outputs_llamacpp.json", "w") as f:
