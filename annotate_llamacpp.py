@@ -16,6 +16,18 @@ def parse_args():
         action="store_true",
         help="Delete existing checkpoint pickle and start from scratch (does not delete fever_train.jsonl).",
     )
+    p.add_argument(
+        "--n-ctx",
+        type=int,
+        default=32_768,
+        help="Llama context size (prompt + completion KV). Qwen3.5 trains at 262144; raise if long CoT + answers. Lower if VRAM OOM.",
+    )
+    p.add_argument(
+        "--max-tokens",
+        type=int,
+        default=4096,
+        help="Max new tokens per generation (raise if the model stops mid 'thinking' before the final label line).",
+    )
     return p.parse_args()
 
 
@@ -33,11 +45,13 @@ if ARGS.restart and os.path.isfile(CHECKPOINT_PATH):
     os.remove(CHECKPOINT_PATH)
     print(f"Removed checkpoint (--restart): {CHECKPOINT_PATH}")
 
+print(f"Loading model: n_ctx={ARGS.n_ctx}, max_new_tokens={ARGS.max_tokens}")
+
 llm = Llama.from_pretrained(
     repo_id=MODEL_REPO_ID,
     filename=MODEL_FILENAME,
     n_gpu_layers=-1,
-    n_ctx=4096,
+    n_ctx=ARGS.n_ctx,
     verbose=False,
 )
 
@@ -114,7 +128,7 @@ TASK:
 Given the CLAIM below, select ALL applicable labels from OPTIONS.
 
 OUTPUT RULES (mandatory):
-1. You may think step by step in earlier lines if needed.
+1. Be concise: at most a few short sentences of reasoning (or none). Do NOT write long essays, "Thinking Process:" sections, or numbered analysis—keep everything before the final line minimal.
 2. The VERY LAST non-empty line of your entire reply MUST be your only machine-readable answer.
 3. That final line MUST contain NOTHING except labels taken verbatim from OPTIONS (copy the full text exactly as written under OPTIONS).
 4. Separate multiple labels with a comma followed by a space: ", "
@@ -127,7 +141,7 @@ OPTIONS:
 CLAIM:
 {claim}
 
-End your reply so the last line is only comma-separated labels copied from OPTIONS.""".strip()
+Prefer zero or one brief sentence of rationale, then end: your last line must be ONLY comma-separated labels copied from OPTIONS.""".strip()
 
 
 # =========================
@@ -143,7 +157,7 @@ def call_model(prompt):
         top_p=0.8,
         top_k=20,
         min_p=0.0,
-        max_tokens=512,
+        max_tokens=ARGS.max_tokens,
     )
     raw = response["choices"][0]["message"]["content"]
     if raw is None:
