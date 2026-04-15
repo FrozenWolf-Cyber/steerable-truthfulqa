@@ -222,9 +222,11 @@ def to_vector(labels, concepts):
     return vec
 
 
-def log_sample(claim, prompt, raw_output, idx: int):
+def log_sample(claim, prompt, raw_output, idx: int, total: int):
+    done = idx + 1
+    remaining = total - done
     print("\n============")
-    print(f"sample_index={idx}")
+    print(f"sample_index={idx}  |  {done} done, {remaining} more to go")
     print("[claim]")
     print(claim)
     print("------------")
@@ -293,7 +295,7 @@ for i, ex in enumerate(tqdm(dataset[start_idx:], initial=start_idx, total=len(da
         print(f"[model-error] {type(e).__name__}: {str(e)[:200]}")
         raw_output = ""
 
-    log_sample(claim, prompt, raw_output, global_idx)
+    log_sample(claim, prompt, raw_output, global_idx, len(dataset))
 
     try:
         labels = parse_output(raw_output, concepts)
