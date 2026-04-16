@@ -152,16 +152,18 @@ def run_single_method(
 
 
 def build_pace_cfg(layer_idx: int, args) -> dict:
+    max_concepts = -1 if args.pace_max_concepts == -1 else args.pace_max_concepts
     return {
         "index_path": args.pace_index_path,
         "representation_path": args.pace_representation_path,
-        "max_concepts": args.pace_max_concepts,
+        "max_concepts": max_concepts,
         "partition_mode": "heuristic",
         "partition_file": None,
         "vector_cache_path": f"./pace_cache/layer{layer_idx}",
         "encode_batch_size": 8,
         "alpha": args.pace_alpha,
         "layer_idx": layer_idx,
+        "pace_gpu": args.pace_gpu,
     }
 
 
@@ -184,8 +186,11 @@ def main():
 
     parser.add_argument("--pace_index_path", type=str, default="./pace_data/concept_index.txt")
     parser.add_argument("--pace_representation_path", type=str, default="./pace_data/concept/")
-    parser.add_argument("--pace_max_concepts", type=int, default=5000)
+    parser.add_argument("--pace_max_concepts", type=int, default=5000,
+                        help="Max concepts to use for PaCE. Set -1 to use all concepts in index.")
     parser.add_argument("--pace_alpha", type=float, default=1.0)
+    parser.add_argument("--pace_gpu", action="store_true",
+                        help="Run PaCE sparse decomposition on GPU (faster, may slightly change outputs).")
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir) if args.data_dir else None

@@ -58,7 +58,32 @@ def decompose_sparse(
     target: torch.Tensor,
     dictionary: List[torch.Tensor],
     normalize: bool = True,
+    use_gpu: bool = False,
 ) -> torch.Tensor:
+    if use_gpu:
+        data = torch.stack([target.view(-1)] + [a.view(-1) for a in dictionary], dim=0).float()
+        embedded = _svd_embed(data.T).T
+
+        y = embedded[0:1].clone()
+        D = embedded[1:].clone()
+
+        if normalize:
+            eps = 1e-12
+            norm_y = torch.linalg.norm(y, dim=1, keepdim=True).clamp_min(eps)
+            norm_D = torch.linalg.norm(D, dim=1, keepdim=True).clamp_min(eps)
+            y = y / norm_y
+            D = D / norm_D
+        else:
+            norm_y = torch.ones((1, 1), device=embedded.device, dtype=embedded.dtype)
+            norm_D = torch.ones((D.shape[0], 1), device=embedded.device, dtype=embedded.dtype)
+
+        c = torch.linalg.lstsq(D.T, y.T).solution.squeeze(-1)
+
+        if normalize:
+            c = c / norm_D.squeeze(-1) * norm_y.squeeze()
+
+        return c.to(dtype=torch.float32)
+
     data = torch.stack([target.view(-1)] + [a.view(-1) for a in dictionary], dim=0)
     embedded = _svd_embed(data.T).T
 
@@ -247,6 +272,7 @@ class PaCESteerer:
         self.tokenizer = tokenizer
         self.layer_idx: int = cfg["layer_idx"]
         self._hook_handle = None
+        self.pace_gpu: bool = bool(cfg.get("pace_gpu", False))
 
         concept_dict = ConceptDictionary(
             index_path=cfg["index_path"],
@@ -271,6 +297,9 @@ class PaCESteerer:
         )
 
         self.alpha: float = cfg.get("alpha", 1.0)
+        self._concept_vectors_gpu: Optional[List[torch.Tensor]] = None
+        if self.pace_gpu:
+            self._concept_vectors_gpu = []
 
     def fit(self, *args, **kwargs):
         return self
@@ -280,7 +309,27 @@ class PaCESteerer:
             return activation
 
         dev, dtype = activation.device, activation.dtype
-        # Concept vectors and lstsq live on CPU; activations may be CUDA.
+        if self.pace_gpu:
+            if self._concept_vectors_gpu is None or len(self._concept_vectors_gpu) != len(self.concept_vectors):
+                self._concept_vectors_gpu = []
+            if len(self._concept_vectors_gpu) == 0 or self._concept_vectors_gpu[0].device != dev:
+                self._concept_vectors_gpu = [v.to(device=dev, dtype=torch.float32) for v in self.concept_vectors]
+
+            act_gpu = activation.detach().float()
+            coeffs = decompose_sparse(
+                target=act_gpu,
+                dictionary=self._concept_vectors_gpu,
+                normalize=True,
+                use_gpu=True,
+            )
+            correction = torch.zeros_like(act_gpu)
+            for idx in self.undesirable_idx:
+                if idx < len(coeffs):
+                    correction += coeffs[idx] * self._concept_vectors_gpu[idx]
+            steered = act_gpu - self.alpha * correction
+            return steered.to(dtype=dtype)
+
+        # CPU reference path.
         act_cpu = activation.detach().float().cpu()
         coeffs = decompose_sparse(
             target=act_cpu, dictionary=self.concept_vectors, normalize=True,
