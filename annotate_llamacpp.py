@@ -14,40 +14,37 @@ def parse_args():
     p.add_argument(
         "--restart",
         action="store_true",
-        help="Delete existing checkpoint pickle and start from scratch (does not delete fever_train.jsonl).",
+        help="Delete existing checkpoint pickle and start from scratch.",
     )
     p.add_argument(
         "--n-ctx",
         type=int,
-        default=32_768,
-        help="Llama context size (prompt + completion KV). Qwen3.5 trains at 262144; raise if long CoT + answers. Lower if VRAM OOM.",
+        default=4096,
+        help="Llama context size. Keep low since we use /no_think and short outputs.",
     )
     p.add_argument(
         "--max-tokens",
         type=int,
-        default=4096,
-        help="Max new tokens per generation (raise if the model stops mid 'thinking' before the final label line).",
+        default=256,
+        help="Max new tokens per generation. 256 is plenty for a label line.",
     )
     p.add_argument(
         "--repeat-penalty",
         type=float,
-        default=1.1,
-        help="Repetition penalty for generation (1.0 disables).",
+        default=1.15,
+        help="Repetition penalty (1.0 disables). 1.1-1.2 is a good range.",
     )
     p.add_argument(
-        "--reasoning-budget",
-        type=int,
-        default=5,
-        help="llama.cpp reasoning_budget generation argument.",
+        "--temperature",
+        type=float,
+        default=0.1,
+        help="Sampling temperature. Low (0.05-0.15) for deterministic classification.",
     )
     return p.parse_args()
 
 
 ARGS = parse_args()
 
-# =========================
-# 1. Llama.cpp setup (A100)
-# =========================
 MODEL_REPO_ID = "unsloth/Qwen3.5-27B-GGUF"
 MODEL_FILENAME = "Qwen3.5-27B-Q8_0.gguf"
 CHECKPOINT_PATH = "fever_progress_llamacpp.pkl"
@@ -58,11 +55,8 @@ if ARGS.restart and os.path.isfile(CHECKPOINT_PATH):
     print(f"Removed checkpoint (--restart): {CHECKPOINT_PATH}")
 
 print(
-    "Loading model: "
-    f"n_ctx={ARGS.n_ctx}, "
-    f"max_new_tokens={ARGS.max_tokens}, "
-    f"repeat_penalty={ARGS.repeat_penalty}, "
-    f"reasoning_budget={ARGS.reasoning_budget}"
+    f"Loading model: n_ctx={ARGS.n_ctx}, max_tokens={ARGS.max_tokens}, "
+    f"repeat_penalty={ARGS.repeat_penalty}, temperature={ARGS.temperature}"
 )
 
 llm = Llama.from_pretrained(
@@ -75,7 +69,7 @@ llm = Llama.from_pretrained(
 
 
 # =========================
-# 2. FEVER concept sets
+# FEVER concept sets
 # =========================
 FEVER_CONCEPTS_ALL = [
     "claim directly supported by verifiable documented evidence",
@@ -110,7 +104,7 @@ NEI_CONCEPTS = [
 
 
 # =========================
-# 3. FEVER concept routing
+# Label routing
 # =========================
 def normalize_label(label):
     if isinstance(label, (int, np.integer)):
@@ -119,7 +113,6 @@ def normalize_label(label):
         if label == 1:
             return "REFUTES"
         return "NOT ENOUGH INFO"
-
     label_str = str(label).strip().upper()
     if label_str in ["SUPPORTS", "REFUTES"]:
         return label_str
@@ -136,61 +129,61 @@ def get_concepts(label):
 
 
 # =========================
-# 4. Prompt builder (strict, machine-parseable last line)
+# Prompt builder
+# /no_think in the system prompt tells Qwen3 to skip CoT entirely.
+# This is the official Qwen3 way to suppress thinking without
+# needing reasoning_budget hacks.
 # =========================
+SYSTEM_PROMPT = (
+    "/no_think\n"
+    "You are a strict multi-label classifier. "
+    "Output ONLY the final answer line — comma-separated labels copied verbatim "
+    "from the OPTIONS list. No preamble, no explanation, no bullet points."
+)
+
+
 def build_prompt(claim, concepts):
     opts_block = "\n".join(f"- {c}" for c in concepts)
-    return f"""You are a strict multi-label classifier for fact-checking concepts.
-
-TASK:
-Given the CLAIM below, select ALL applicable labels from OPTIONS.
-
-OUTPUT RULES (mandatory):
-1. Keep it as concise and straight as possible.
-2. The VERY LAST non-empty line of your entire reply MUST be your only machine-readable answer.
-3. That final line MUST contain NOTHING except labels taken verbatim from OPTIONS (copy the full text exactly as written under OPTIONS).
-4. Separate multiple labels with a comma followed by a space: ", "
-5. Do NOT number labels, do NOT use "Option 1/2", do NOT add quotes, bullets, or extra words on that final line.
-6. Regex target: ^(<exact option text>(, <exact option text>)*)$
-7. Example final line format:
-   claim directly supported by verifiable documented evidence, claim with explicit attribution to a named source or study
-
-OPTIONS:
-{opts_block}
-
-CLAIM:
-{claim}
-
-Keep it concise and straight, then end: your last line must be ONLY comma-separated labels copied from OPTIONS.""".strip()
+    return (
+        f"Select ALL applicable labels from OPTIONS for the CLAIM below.\n\n"
+        f"OPTIONS:\n{opts_block}\n\n"
+        f"CLAIM:\n{claim}\n\n"
+        f"Your answer (last line, comma-separated labels only, verbatim from OPTIONS):"
+    )
 
 
 # =========================
-# 5. Llama.cpp call
+# Model call
+# No reasoning_budget — that's what was causing empty outputs.
+# /no_think in system prompt handles thinking suppression cleanly.
 # =========================
-_THINK_RE = re.compile(r"<redacted_thinking>.*?</redacted_thinking>\s*", re.DOTALL)
-
-
 def call_model(prompt):
     response = llm.create_chat_completion(
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.7,
-        top_p=0.8,
-        top_k=20,
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=ARGS.temperature,
+        top_p=0.9,
+        top_k=40,
         min_p=0.0,
-        reasoning_budget=ARGS.reasoning_budget,
         repeat_penalty=ARGS.repeat_penalty,
         max_tokens=ARGS.max_tokens,
     )
     raw = response["choices"][0]["message"]["content"]
     if raw is None:
         raw = ""
-    raw = raw if isinstance(raw, str) else str(raw)
-    return raw
+    return raw if isinstance(raw, str) else str(raw)
+
+
+# =========================
+# Strip any residual think tags (just in case)
+# =========================
+_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL | re.IGNORECASE)
 
 
 def strip_thinking(text: str) -> str:
-    text = _THINK_RE.sub("", text).strip()
-    return text
+    return _THINK_RE.sub("", text).strip()
 
 
 def last_non_empty_line(text: str) -> str:
@@ -200,7 +193,7 @@ def last_non_empty_line(text: str) -> str:
 
 
 # =========================
-# 6. Parser (last line only; regex-friendly)
+# Parser
 # =========================
 def parse_output(output, concepts):
     last = last_non_empty_line(output)
@@ -209,60 +202,50 @@ def parse_output(output, concepts):
 
     parts = [p.strip() for p in last.split(",") if p.strip()]
     labels = []
-    concept_set = {c: c for c in concepts}
 
     for p in parts:
-        if p in concept_set:
-            labels.append(p)
+        # Exact match
+        if p in concepts:
+            if p not in labels:
+                labels.append(p)
             continue
-        matched = None
-        for c in concepts:
-            if c.lower() == p.lower():
-                matched = c
-                break
+        # Case-insensitive exact match
+        matched = next((c for c in concepts if c.lower() == p.lower()), None)
         if matched:
             if matched not in labels:
                 labels.append(matched)
             continue
+        # Substring match (fallback)
         for c in concepts:
             if p.lower() in c.lower() or c.lower() in p.lower():
                 if c not in labels:
                     labels.append(c)
                 break
 
-    if len(labels) == 0:
-        labels = [concepts[0]]
-
-    return labels
+    return labels if labels else [concepts[0]]
 
 
 # =========================
-# 7. Convert to vector
+# Convert labels to vector
 # =========================
 def to_vector(labels, concepts):
     vec = np.zeros(len(FEVER_CONCEPTS_ALL), dtype=np.float32)
-    selected = [c for c in labels if c in concepts]
-    if len(selected) == 0:
-        selected = [concepts[0]]
-
+    selected = [c for c in labels if c in concepts] or [concepts[0]]
     for c in selected:
         try:
             idx = FEVER_CONCEPTS_ALL.index(c)
+            vec[idx] = 1.0
         except ValueError:
             continue
-        vec[idx] = 1.0
-
     s = float(vec.sum())
     if s > 0:
-        vec = vec / s
+        vec /= s
     return vec
 
 
 def log_sample(claim, prompt, raw_output, idx: int, total: int):
-    done = idx + 1
-    remaining = total - done
     print("\n============")
-    print(f"sample_index={idx}  |  {done} done, {remaining} more to go")
+    print(f"sample_index={idx}  |  {idx+1} done, {total-idx-1} remaining")
     print("[claim]")
     print(claim)
     print("------------")
@@ -270,24 +253,27 @@ def log_sample(claim, prompt, raw_output, idx: int, total: int):
     print(prompt)
     print("------------")
     print("[raw_model_output]")
-    print(raw_output)
+    print(repr(raw_output))  # repr so empty/whitespace-only is obvious
     print("============\n", flush=True)
 
 
+# =========================
+# Dataset runner
+# =========================
 def run_dataset(
     dataset_name: str,
     dataset_url: str,
     local_path: str,
     checkpoint_path: str,
     output_prefix: str,
-    max_samples: int | None = None,
+    max_samples=None,
 ):
     if ARGS.restart and os.path.isfile(checkpoint_path):
         os.remove(checkpoint_path)
         print(f"Removed checkpoint (--restart): {checkpoint_path}")
 
     if not os.path.exists(local_path):
-        print(f"Downloading {dataset_name} from {dataset_url} ...")
+        print(f"Downloading {dataset_name} ...")
         urllib.request.urlretrieve(dataset_url, local_path)
         print("Download complete.")
 
@@ -296,30 +282,24 @@ def run_dataset(
     if max_samples is not None:
         dataset = dataset[:max_samples]
 
-    all_vectors = []
-    all_claims = []
-    all_labels = []
-    all_prompts = []
-    all_outputs_raw = []
-    all_parse_errors = []
+    all_vectors, all_claims, all_labels = [], [], []
+    all_prompts, all_outputs_raw, all_parse_errors = [], [], []
 
     try:
         with open(checkpoint_path, "rb") as f:
             ckpt = pickle.load(f)
-        all_vectors = ckpt.get("all_vectors", [])
-        all_claims = ckpt.get("all_claims", [])
-        all_labels = ckpt.get("all_labels", [])
-        all_prompts = ckpt.get("all_prompts", [])
+        all_vectors     = ckpt.get("all_vectors", [])
+        all_claims      = ckpt.get("all_claims", [])
+        all_labels      = ckpt.get("all_labels", [])
+        all_prompts     = ckpt.get("all_prompts", [])
         all_outputs_raw = ckpt.get("all_outputs_raw", ckpt.get("all_outputs", []))
-        all_parse_errors = ckpt.get("all_parse_errors", [])
+        all_parse_errors= ckpt.get("all_parse_errors", [])
+        # pad prompts if checkpoint is from older version
         if len(all_prompts) < len(all_claims):
             all_prompts = (all_prompts + [""] * len(all_claims))[: len(all_claims)]
-        print(
-            f"[{dataset_name}] Resuming from checkpoint: "
-            f"{len(all_claims)} examples already processed"
-        )
+        print(f"[{dataset_name}] Resuming: {len(all_claims)} already done.")
     except FileNotFoundError:
-        print(f"[{dataset_name}] No checkpoint found. Starting fresh.")
+        print(f"[{dataset_name}] No checkpoint. Starting fresh.")
 
     start_idx = len(all_claims)
 
@@ -371,35 +351,33 @@ def run_dataset(
             )
 
     vectors_path = f"{output_prefix}_concept_vectors_llamacpp.npy"
-    claims_path = f"{output_prefix}_claims_llamacpp.npy"
-    raw_json_path = f"{output_prefix}_raw_outputs_llamacpp.json"
+    claims_path  = f"{output_prefix}_claims_llamacpp.npy"
+    raw_json_path= f"{output_prefix}_raw_outputs_llamacpp.json"
 
-    if len(all_vectors):
+    if all_vectors:
         np.save(vectors_path, np.stack(all_vectors, axis=0))
-        np.save(claims_path, np.array(all_claims))
+        np.save(claims_path,  np.array(all_claims))
     else:
-        print(f"[{dataset_name}] No vectors to save (empty run).")
-
-    payload = {
-        "claims": all_claims,
-        "fever_labels": all_labels,
-        "prompts": all_prompts,
-        "outputs_raw": all_outputs_raw,
-        "parse_errors": all_parse_errors,
-    }
+        print(f"[{dataset_name}] No vectors to save.")
 
     with open(raw_json_path, "w") as f:
-        json.dump(payload, f, ensure_ascii=False)
+        json.dump(
+            {
+                "claims": all_claims,
+                "fever_labels": all_labels,
+                "prompts": all_prompts,
+                "outputs_raw": all_outputs_raw,
+                "parse_errors": all_parse_errors,
+            },
+            f,
+            ensure_ascii=False,
+        )
 
-    print(f"[{dataset_name}] DONE")
-    print(
-        f"[{dataset_name}] Saved: {vectors_path}, {claims_path}, "
-        f"{raw_json_path}, {checkpoint_path}"
-    )
+    print(f"[{dataset_name}] DONE — saved {vectors_path}, {claims_path}, {raw_json_path}")
 
 
 # =========================
-# 8-10. Run datasets
+# Run
 # =========================
 run_dataset(
     dataset_name="FEVER_TRAIN",
