@@ -252,117 +252,147 @@ def log_sample(claim, prompt, raw_output, idx: int, total: int):
     print("============\n", flush=True)
 
 
-# =========================
-# 8. Load FEVER + resume checkpoint
-# =========================
-FEVER_TRAIN_URL = "https://fever.ai/download/fever/train.jsonl"
-FEVER_LOCAL_PATH = "fever_train.jsonl"
+def run_dataset(
+    dataset_name: str,
+    dataset_url: str,
+    local_path: str,
+    checkpoint_path: str,
+    output_prefix: str,
+    max_samples: int | None = None,
+):
+    if ARGS.restart and os.path.isfile(checkpoint_path):
+        os.remove(checkpoint_path)
+        print(f"Removed checkpoint (--restart): {checkpoint_path}")
 
-if not os.path.exists(FEVER_LOCAL_PATH):
-    print(f"Downloading FEVER training set from {FEVER_TRAIN_URL} ...")
-    urllib.request.urlretrieve(FEVER_TRAIN_URL, FEVER_LOCAL_PATH)
-    print("Download complete.")
+    if not os.path.exists(local_path):
+        print(f"Downloading {dataset_name} from {dataset_url} ...")
+        urllib.request.urlretrieve(dataset_url, local_path)
+        print("Download complete.")
 
-with open(FEVER_LOCAL_PATH) as f:
-    dataset = [json.loads(line) for line in f]
-dataset = dataset[:MAX_SAMPLES]
+    with open(local_path) as f:
+        dataset = [json.loads(line) for line in f]
+    if max_samples is not None:
+        dataset = dataset[:max_samples]
 
-all_vectors = []
-all_claims = []
-all_labels = []
-all_prompts = []
-all_outputs_raw = []
-all_parse_errors = []
-
-try:
-    with open(CHECKPOINT_PATH, "rb") as f:
-        ckpt = pickle.load(f)
-    all_vectors = ckpt.get("all_vectors", [])
-    all_claims = ckpt.get("all_claims", [])
-    all_labels = ckpt.get("all_labels", [])
-    all_prompts = ckpt.get("all_prompts", [])
-    all_outputs_raw = ckpt.get("all_outputs_raw", ckpt.get("all_outputs", []))
-    all_parse_errors = ckpt.get("all_parse_errors", [])
-    if len(all_prompts) < len(all_claims):
-        all_prompts = (all_prompts + [""] * len(all_claims))[: len(all_claims)]
-    print(f"Resuming from checkpoint: {len(all_claims)} examples already processed")
-except FileNotFoundError:
-    print("No checkpoint found. Starting fresh.")
-
-start_idx = len(all_claims)
-
-
-# =========================
-# 9. Annotation loop (checkpoint every response)
-# =========================
-for i, ex in enumerate(tqdm(dataset[start_idx:], initial=start_idx, total=len(dataset))):
-    global_idx = start_idx + i
-    claim = ex["claim"]
-    label = normalize_label(ex["label"])
-    concepts = get_concepts(label)
-    prompt = build_prompt(claim, concepts)
-    parse_error = ""
+    all_vectors = []
+    all_claims = []
+    all_labels = []
+    all_prompts = []
+    all_outputs_raw = []
+    all_parse_errors = []
 
     try:
-        raw_output = call_model(prompt)
-    except Exception as e:
-        print(f"[model-error] {type(e).__name__}: {str(e)[:200]}")
-        raw_output = ""
-
-    log_sample(claim, prompt, raw_output, global_idx, len(dataset))
-
-    try:
-        labels = parse_output(raw_output, concepts)
-        vec = to_vector(labels, concepts)
-    except Exception as e:
-        parse_error = f"{type(e).__name__}: {str(e)[:200]}"
-        print(f"[parse-error] {parse_error}")
-        labels = [concepts[0]]
-        vec = to_vector(labels, concepts)
-
-    all_vectors.append(vec)
-    all_claims.append(claim)
-    all_labels.append(label)
-    all_prompts.append(prompt)
-    all_outputs_raw.append(raw_output)
-    all_parse_errors.append(parse_error)
-
-    with open(CHECKPOINT_PATH, "wb") as f:
-        pickle.dump(
-            {
-                "all_vectors": all_vectors,
-                "all_claims": all_claims,
-                "all_labels": all_labels,
-                "all_prompts": all_prompts,
-                "all_outputs_raw": all_outputs_raw,
-                "all_parse_errors": all_parse_errors,
-            },
-            f,
+        with open(checkpoint_path, "rb") as f:
+            ckpt = pickle.load(f)
+        all_vectors = ckpt.get("all_vectors", [])
+        all_claims = ckpt.get("all_claims", [])
+        all_labels = ckpt.get("all_labels", [])
+        all_prompts = ckpt.get("all_prompts", [])
+        all_outputs_raw = ckpt.get("all_outputs_raw", ckpt.get("all_outputs", []))
+        all_parse_errors = ckpt.get("all_parse_errors", [])
+        if len(all_prompts) < len(all_claims):
+            all_prompts = (all_prompts + [""] * len(all_claims))[: len(all_claims)]
+        print(
+            f"[{dataset_name}] Resuming from checkpoint: "
+            f"{len(all_claims)} examples already processed"
         )
+    except FileNotFoundError:
+        print(f"[{dataset_name}] No checkpoint found. Starting fresh.")
+
+    start_idx = len(all_claims)
+
+    for i, ex in enumerate(
+        tqdm(dataset[start_idx:], initial=start_idx, total=len(dataset), desc=dataset_name)
+    ):
+        global_idx = start_idx + i
+        claim = ex["claim"]
+        label = normalize_label(ex.get("label", "NOT ENOUGH INFO"))
+        concepts = get_concepts(label)
+        prompt = build_prompt(claim, concepts)
+        parse_error = ""
+
+        try:
+            raw_output = call_model(prompt)
+        except Exception as e:
+            print(f"[{dataset_name}][model-error] {type(e).__name__}: {str(e)[:200]}")
+            raw_output = ""
+
+        log_sample(claim, prompt, raw_output, global_idx, len(dataset))
+
+        try:
+            labels = parse_output(raw_output, concepts)
+            vec = to_vector(labels, concepts)
+        except Exception as e:
+            parse_error = f"{type(e).__name__}: {str(e)[:200]}"
+            print(f"[{dataset_name}][parse-error] {parse_error}")
+            labels = [concepts[0]]
+            vec = to_vector(labels, concepts)
+
+        all_vectors.append(vec)
+        all_claims.append(claim)
+        all_labels.append(label)
+        all_prompts.append(prompt)
+        all_outputs_raw.append(raw_output)
+        all_parse_errors.append(parse_error)
+
+        with open(checkpoint_path, "wb") as f:
+            pickle.dump(
+                {
+                    "all_vectors": all_vectors,
+                    "all_claims": all_claims,
+                    "all_labels": all_labels,
+                    "all_prompts": all_prompts,
+                    "all_outputs_raw": all_outputs_raw,
+                    "all_parse_errors": all_parse_errors,
+                },
+                f,
+            )
+
+    vectors_path = f"{output_prefix}_concept_vectors_llamacpp.npy"
+    claims_path = f"{output_prefix}_claims_llamacpp.npy"
+    raw_json_path = f"{output_prefix}_raw_outputs_llamacpp.json"
+
+    if len(all_vectors):
+        np.save(vectors_path, np.stack(all_vectors, axis=0))
+        np.save(claims_path, np.array(all_claims))
+    else:
+        print(f"[{dataset_name}] No vectors to save (empty run).")
+
+    payload = {
+        "claims": all_claims,
+        "fever_labels": all_labels,
+        "prompts": all_prompts,
+        "outputs_raw": all_outputs_raw,
+        "parse_errors": all_parse_errors,
+    }
+
+    with open(raw_json_path, "w") as f:
+        json.dump(payload, f, ensure_ascii=False)
+
+    print(f"[{dataset_name}] DONE")
+    print(
+        f"[{dataset_name}] Saved: {vectors_path}, {claims_path}, "
+        f"{raw_json_path}, {checkpoint_path}"
+    )
 
 
 # =========================
-# 10. Save outputs
+# 8-10. Run datasets
 # =========================
-if len(all_vectors):
-    np.save("fever_concept_vectors_llamacpp.npy", np.stack(all_vectors, axis=0))
-    np.save("fever_claims_llamacpp.npy", np.array(all_claims))
-else:
-    print("No vectors to save (empty run).")
+run_dataset(
+    dataset_name="FEVER_TRAIN",
+    dataset_url="https://fever.ai/download/fever/train.jsonl",
+    local_path="fever_train.jsonl",
+    checkpoint_path="fever_progress_llamacpp.pkl",
+    output_prefix="fever",
+    max_samples=MAX_SAMPLES,
+)
 
-payload = {
-    "claims": all_claims,
-    "fever_labels": all_labels,
-    "prompts": all_prompts,
-    "outputs_raw": all_outputs_raw,
-    "parse_errors": all_parse_errors,
-}
-
-with open("fever_raw_outputs_llamacpp.json", "w") as f:
-    json.dump(payload, f, ensure_ascii=False)
-
-print("DONE")
-print(
-    "Saved: fever_concept_vectors_llamacpp.npy, fever_claims_llamacpp.npy, "
-    "fever_raw_outputs_llamacpp.json, fever_progress_llamacpp.pkl"
+run_dataset(
+    dataset_name="FEVER_PAPER_TEST",
+    dataset_url="https://fever.ai/download/fever/paper_test.jsonl",
+    local_path="fever_paper_test.jsonl",
+    checkpoint_path="fever_paper_test_progress_llamacpp.pkl",
+    output_prefix="fever_paper_test",
+    max_samples=None,
 )
