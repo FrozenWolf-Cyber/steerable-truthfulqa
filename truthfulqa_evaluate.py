@@ -13,8 +13,8 @@ Replicates the exact same metrics as ODESteer's truthfulqa_eval.py:
   - Dist-1, Dist-2, Dist-3
 
 Usage:
-  python evaluate.py -m Llama3.1-8B-Base -l 13 -d
-  python evaluate.py --results_dir ./results/truthfulqa/raw_outputs -d
+  python truthfulqa_evaluate.py -m Llama3.1-8B-Base -l 13 -d
+  python truthfulqa_evaluate.py --results_dir ./results/truthfulqa/raw_outputs -d
 """
 
 import argparse

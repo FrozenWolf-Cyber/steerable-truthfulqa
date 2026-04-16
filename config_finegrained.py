@@ -8,6 +8,25 @@ configs from other subprojects (e.g., CB-LLMs).
 # FEVER label convention (HF "fever" v1.0):
 # 0 = SUPPORTS, 1 = REFUTES, 2 = NOT ENOUGH INFO
 
+# Short, stable class names (good for logging keys / cache paths)
+FEVER_LABEL_NAMES = [
+    "SUPPORTS",
+    "REFUTES",
+    "NOT ENOUGH INFO",
+]
+
+# Descriptive holders for embedding-based eval (MPNet) / prompting
+FEVER_LABEL_CONCEPTS = [
+    # SUPPORTS →
+    "text that affirms a claim by grounding it in evidence and reasoning",
+
+    # REFUTES →
+    "text that challenges a claim by presenting counter-evidence or contradiction",
+
+    # NEI →
+    "text that suspends judgment by acknowledging insufficient evidence",
+]
+
 FEVER_CONCEPTS_ALL = [
     "claim directly supported by verifiable documented evidence",
     "claim with explicit attribution to a named source or study",

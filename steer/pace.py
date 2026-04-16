@@ -25,16 +25,33 @@ How this file works
    (scaled by `alpha`) from the activation — suppressing those directions in
    residual space.
 
-Dictionary math stays on **CPU** (NumPy `lstsq`); activations are moved CPU for
-the solve and moved back to the model device/dtype (see `_steer_activation`).
+Dictionary math stays on **CPU** (NumPy `lstsq`) unless ``pace_gpu`` is set; either
+way the cost is dominated by **one full-dictionary** SVD + least-squares per
+token position (see ``decompose_sparse``).
+
+**Why runs can take hours**
+
+1. **Concept encoding** (``encode_dictionary``): one forward pass per concept
+   (sequential). With tens of thousands of concepts and a large LM, wall time is
+   roughly ``#concepts × time_per_forward`` unless vectors are already cached on disk.
+
+2. **Generation with the hook**: on every forward at the hooked layer, for each
+   batch and sequence position the code calls ``decompose_sparse`` over **all**
+   loaded concept vectors, then sums **undesirable** directions. Complexity is
+   roughly ``O(forward_steps × B × T × n_concepts × d)`` in the hook alone — far
+   heavier than plain generation. ``pace_gpu`` moves the linear algebra to GPU but
+   does not remove the per-token full-dictionary work.
+
+Enable ``pace_token_timing`` in the PaCE cfg to print per-position timings.
 """
 
 from __future__ import annotations
 
 import ast
 import logging
+import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -59,11 +76,26 @@ def decompose_sparse(
     dictionary: List[torch.Tensor],
     normalize: bool = True,
     use_gpu: bool = False,
-) -> torch.Tensor:
-    if use_gpu:
-        data = torch.stack([target.view(-1)] + [a.view(-1) for a in dictionary], dim=0).float()
-        embedded = _svd_embed(data.T).T
+    return_timings: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, dict]]:
+    """
+    If return_timings is True, returns (coeffs, timings_dict) with keys in seconds:
+    stack_embed, svd, norm, lstsq (GPU path) or stack_embed, svd, numpy, lstsq (CPU path).
+    """
+    t_all = time.perf_counter()
 
+    if use_gpu:
+        t0 = time.perf_counter()
+        data = torch.stack([target.view(-1)] + [a.view(-1) for a in dictionary], dim=0).float()
+        t_stack = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        embedded = _svd_embed(data.T).T
+        if return_timings and embedded.is_cuda:
+            torch.cuda.synchronize()
+        t_svd = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
         y = embedded[0:1].clone()
         D = embedded[1:].clone()
 
@@ -77,17 +109,38 @@ def decompose_sparse(
             norm_y = torch.ones((1, 1), device=embedded.device, dtype=embedded.dtype)
             norm_D = torch.ones((D.shape[0], 1), device=embedded.device, dtype=embedded.dtype)
 
+        t_norm = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
         c = torch.linalg.lstsq(D.T, y.T).solution.squeeze(-1)
+        if return_timings and c.is_cuda:
+            torch.cuda.synchronize()
+        t_lstsq = time.perf_counter() - t0
 
         if normalize:
             c = c / norm_D.squeeze(-1) * norm_y.squeeze()
 
-        return c.to(dtype=torch.float32)
+        out = c.to(dtype=torch.float32)
+        if return_timings:
+            t_total = time.perf_counter() - t_all
+            timings = {
+                "stack_embed_s": t_stack,
+                "svd_s": t_svd,
+                "norm_s": t_norm,
+                "lstsq_s": t_lstsq,
+                "decompose_total_s": t_total,
+            }
+            return out, timings
+        return out
 
+    t0 = time.perf_counter()
     data = torch.stack([target.view(-1)] + [a.view(-1) for a in dictionary], dim=0)
     embedded = _svd_embed(data.T).T
+    t_stack_svd = time.perf_counter() - t0
 
+    t0 = time.perf_counter()
     data_np = embedded.numpy().astype(np.float64)
+    t_numpy = time.perf_counter() - t0
     y = data_np[0:1].copy()
     D = data_np[1:].copy()
 
@@ -99,13 +152,26 @@ def decompose_sparse(
     else:
         norm_y, norm_D = 1.0, np.ones((D.shape[0], 1))
 
+    t0 = time.perf_counter()
     c, *_ = np.linalg.lstsq(D.T, y.T, rcond=None)
     c = c.T[0]
+    t_lstsq_np = time.perf_counter() - t0
 
     if normalize:
         c = c / norm_D.squeeze() * norm_y
 
-    return torch.tensor(c, dtype=torch.float32)
+    out = torch.tensor(c, dtype=torch.float32)
+
+    if return_timings:
+        t_total = time.perf_counter() - t_all
+        timings = {
+            "stack_svd_s": t_stack_svd,
+            "to_numpy_s": t_numpy,
+            "lstsq_np_s": t_lstsq_np,
+            "decompose_total_s": t_total,
+        }
+        return out, timings
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +346,8 @@ class PaCESteerer:
         partition_mode (str), partition_file (str|None),
         vector_cache_path (str), encode_batch_size (int),
         alpha (float), layer_idx (int)
+        pace_gpu (bool): run decompose_sparse on GPU (still expensive: full-dict SVD/lstsq per token).
+        pace_token_timing (bool): print per-(batch, seq) position timing for each hook call (verbose).
     """
 
     def __init__(self, cfg: dict, model: nn.Module, tokenizer):
@@ -289,6 +357,8 @@ class PaCESteerer:
         self.layer_idx: int = cfg["layer_idx"]
         self._hook_handle = None
         self.pace_gpu: bool = bool(cfg.get("pace_gpu", False))
+        self.pace_token_timing: bool = bool(cfg.get("pace_token_timing", False))
+        self._timing_token_idx: int = 0
 
         concept_dict = ConceptDictionary(
             index_path=cfg["index_path"],
@@ -320,10 +390,17 @@ class PaCESteerer:
     def fit(self, *args, **kwargs):
         return self
 
-    def _steer_activation(self, activation: torch.Tensor) -> torch.Tensor:
+    def _steer_activation(
+        self,
+        activation: torch.Tensor,
+        profile: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, dict]]:
         if not self.concept_vectors:
+            if profile:
+                return activation, {"steer_total_s": 0.0, "skipped": True}
             return activation
 
+        t_steer0 = time.perf_counter()
         dev, dtype = activation.device, activation.dtype
         if self.pace_gpu:
             if self._concept_vectors_gpu is None or len(self._concept_vectors_gpu) != len(self.concept_vectors):
@@ -331,31 +408,94 @@ class PaCESteerer:
             if len(self._concept_vectors_gpu) == 0 or self._concept_vectors_gpu[0].device != dev:
                 self._concept_vectors_gpu = [v.to(device=dev, dtype=torch.float32) for v in self.concept_vectors]
 
+            t0 = time.perf_counter()
             act_gpu = activation.detach().float()
-            coeffs = decompose_sparse(
-                target=act_gpu,
-                dictionary=self._concept_vectors_gpu,
-                normalize=True,
-                use_gpu=True,
-            )
+            t_prep = time.perf_counter() - t0
+
+            if profile:
+                dec = decompose_sparse(
+                    target=act_gpu,
+                    dictionary=self._concept_vectors_gpu,
+                    normalize=True,
+                    use_gpu=True,
+                    return_timings=True,
+                )
+                coeffs, dec_tim = dec  # type: ignore[misc]
+            else:
+                coeffs = decompose_sparse(
+                    target=act_gpu,
+                    dictionary=self._concept_vectors_gpu,
+                    normalize=True,
+                    use_gpu=True,
+                )
+
+            t0 = time.perf_counter()
             correction = torch.zeros_like(act_gpu)
             for idx in self.undesirable_idx:
                 if idx < len(coeffs):
                     correction += coeffs[idx] * self._concept_vectors_gpu[idx]
+            t_corr = time.perf_counter() - t0
+
             steered = act_gpu - self.alpha * correction
-            return steered.to(dtype=dtype)
+            t0 = time.perf_counter()
+            out = steered.to(dtype=dtype)
+            t_cast = time.perf_counter() - t0
+            t_steer = time.perf_counter() - t_steer0
+
+            if profile:
+                prof: dict = {
+                    "prep_s": t_prep,
+                    "correction_s": t_corr,
+                    "to_dtype_s": t_cast,
+                    "steer_total_s": t_steer,
+                    "n_concepts": len(self.concept_vectors),
+                    "n_undesirable": len(self.undesirable_idx),
+                }
+                prof.update(dec_tim)
+                return out, prof
+            return out
 
         # CPU reference path.
+        t0 = time.perf_counter()
         act_cpu = activation.detach().float().cpu()
-        coeffs = decompose_sparse(
-            target=act_cpu, dictionary=self.concept_vectors, normalize=True,
-        )
+        t_prep = time.perf_counter() - t0
+
+        if profile:
+            dec = decompose_sparse(
+                target=act_cpu, dictionary=self.concept_vectors, normalize=True,
+                return_timings=True,
+            )
+            coeffs, dec_tim = dec  # type: ignore[misc]
+        else:
+            coeffs = decompose_sparse(
+                target=act_cpu, dictionary=self.concept_vectors, normalize=True,
+            )
+
+        t0 = time.perf_counter()
         correction = torch.zeros_like(act_cpu)
         for idx in self.undesirable_idx:
             if idx < len(coeffs):
                 correction += coeffs[idx] * self.concept_vectors[idx]
+        t_corr = time.perf_counter() - t0
+
         steered = act_cpu - self.alpha * correction
-        return steered.to(device=dev, dtype=dtype)
+        t0 = time.perf_counter()
+        out = steered.to(device=dev, dtype=dtype)
+        t_cast = time.perf_counter() - t0
+        t_steer = time.perf_counter() - t_steer0
+
+        if profile:
+            prof = {
+                "prep_s": t_prep,
+                "correction_s": t_corr,
+                "to_dtype_s": t_cast,
+                "steer_total_s": t_steer,
+                "n_concepts": len(self.concept_vectors),
+                "n_undesirable": len(self.undesirable_idx),
+            }
+            prof.update(dec_tim)
+            return out, prof
+        return out
 
     def _hook_fn(self, module, input, output):
         if isinstance(output, tuple):
@@ -363,10 +503,47 @@ class PaCESteerer:
         else:
             hidden = output
         B, T, D = hidden.shape
+        _ms = lambda s: s * 1000.0
+        t_hook0 = time.perf_counter()
         steered = hidden.clone()
+        t_clone = time.perf_counter() - t_hook0
+
         for b in range(B):
             for t in range(T):
-                steered[b, t] = self._steer_activation(hidden[b, t])
+                if self.pace_token_timing:
+                    t_tok0 = time.perf_counter()
+                    out, prof = self._steer_activation(hidden[b, t], profile=True)  # type: ignore[misc]
+                    steered[b, t] = out
+                    t_tok = time.perf_counter() - t_tok0
+                    idx = self._timing_token_idx
+                    self._timing_token_idx += 1
+                    dec_ms = _ms(prof.get("decompose_total_s", prof.get("steer_total_s", 0.0)))
+                    print(
+                        f"[PaCE timing] i={idx} b={b} t={t} "
+                        f"n_concepts={prof.get('n_concepts', '?')} n_undesirable={prof.get('n_undesirable', '?')} "
+                        f"prep_ms={_ms(prof.get('prep_s', 0)):.2f} "
+                        f"stack_embed_ms={_ms(prof.get('stack_embed_s', 0)):.2f} "
+                        f"svd_ms={_ms(prof.get('svd_s', prof.get('stack_svd_s', 0))):.2f} "
+                        f"norm_ms={_ms(prof.get('norm_s', 0)):.2f} "
+                        f"lstsq_ms={_ms(prof.get('lstsq_s', prof.get('lstsq_np_s', 0))):.2f} "
+                        f"correction_ms={_ms(prof.get('correction_s', 0)):.2f} "
+                        f"to_dtype_ms={_ms(prof.get('to_dtype_s', 0)):.2f} "
+                        f"decompose_total_ms={dec_ms:.2f} steer_total_ms={_ms(prof.get('steer_total_s', 0)):.2f} "
+                        f"token_wall_ms={_ms(t_tok):.2f}",
+                        flush=True,
+                    )
+                else:
+                    steered[b, t] = self._steer_activation(hidden[b, t])  # type: ignore[assignment]
+
+        if self.pace_token_timing:
+            t_hook = time.perf_counter() - t_hook0
+            print(
+                f"[PaCE timing] forward_hook layer={self.layer_idx} B={B} T={T} D={D} "
+                f"clone_ms={_ms(t_clone):.2f} hook_total_ms={_ms(t_hook):.2f} "
+                f"positions={B * T}",
+                flush=True,
+            )
+
         if isinstance(output, tuple):
             return (steered,) + output[1:]
         return steered

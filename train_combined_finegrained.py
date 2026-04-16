@@ -1,8 +1,6 @@
 import argparse
 import os
 import time
-from collections import defaultdict
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -14,7 +12,18 @@ import config_finegrained as CFG
 from transformers import LlamaConfig, LlamaModel, AutoTokenizer, RobertaTokenizerFast, AutoModel, AutoModelForCausalLM
 from peft import LoraConfig, TaskType, get_peft_model
 from modules import CBLResidual, CBL, Roberta_classifier
-from utils import elastic_net_penalty, mean_pooling, eos_pooling, cos_sim_cubed, load_jsonl_as_dataset
+from utils import (
+    elastic_net_penalty,
+    mean_pooling,
+    eos_pooling,
+    cos_sim_cubed,
+    load_jsonl_as_dataset,
+    _normalize_fever_label,
+    _apply_fever_concept_mask,
+    _align_fever_dataset_to_llamacpp_claims,
+    _run_llamacpp_concept_cosine_eval,
+    build_intervened_concepts_from_similarity,
+)
 from steerability_cache import save_all_steerability_texts, steerability_output_root
 from eval_metrics import (
     set_seed,
@@ -27,284 +36,10 @@ from eval_metrics import (
     compute_perplexity,
     load_reward_model,
     run_rm_metrics,
+    run_steerability_llamacpp_judge,
 )
 import wandb
 
-
-def _normalize_fever_label(label):
-    """Normalize FEVER labels to ints: 0=SUPPORTS, 1=REFUTES, 2=NEI."""
-    if isinstance(label, (int, np.integer)):
-        if int(label) in (0, 1, 2):
-            return int(label)
-        return 2
-
-    s = str(label).strip().upper()
-    if s == "SUPPORTS":
-        return 0
-    if s == "REFUTES":
-        return 1
-    return 2
-
-
-
-def _apply_fever_concept_mask(similarity: np.ndarray, labels: np.ndarray) -> np.ndarray:
-    """Zero-out concept dims not allowed by the FEVER class label, and renormalize rows."""
-    sim = np.asarray(similarity, dtype=np.float32)
-    labels = np.asarray(labels)
-    labels = np.vectorize(_normalize_fever_label)(labels).astype(np.int64)
-
-    allowed = CFG.FEVER_LABEL_TO_CONCEPT_INDICES
-    mask = np.zeros_like(sim, dtype=np.float32)
-    for y in (0, 1, 2):
-        idxs = allowed.get(int(y), [])
-        if len(idxs) == 0:
-            continue
-        rows = np.flatnonzero(labels == y)
-        if rows.size == 0:
-            continue
-        mask[np.ix_(rows, idxs)] = 1.0
-
-    sim = sim * mask
-    row_sums = sim.sum(axis=1, keepdims=True)
-    nonzero = row_sums > 0
-    sim[nonzero[:, 0]] = sim[nonzero[:, 0]] / row_sums[nonzero]
-    return sim
-
-
-def _num_rows_encoded(encoded):
-    """Return number of examples for either a HF Dataset or a dict-of-columns."""
-    if isinstance(encoded, dict):
-        if "input_ids" in encoded:
-            return len(encoded["input_ids"])
-        if "label" in encoded:
-            return len(encoded["label"])
-        first_key = next(iter(encoded.keys()))
-        return len(encoded[first_key])
-    return len(encoded)
-
-
-def _truncate_encoded(encoded, n: int):
-    if isinstance(encoded, dict):
-        return {k: v[:n] for k, v in encoded.items()}
-    return encoded.select(range(n))
-
-
-def _align_similarity_and_encoded(similarity: np.ndarray, encoded, split_name: str):
-    n_sim = int(similarity.shape[0])
-    n_data = int(_num_rows_encoded(encoded))
-    if n_sim == n_data:
-        return similarity, encoded
-
-    n = min(n_sim, n_data)
-    print(
-        f"WARNING: {split_name} concept-label rows ({n_sim}) != {split_name} dataset rows ({n_data}). "
-        f"Truncating both to {n}. "
-        "(This usually means the dataset is filtered/subsampled in this script but the concept labels were generated "
-        "for the original split.)"
-    )
-    return similarity[:n], _truncate_encoded(encoded, n)
-
-
-def _infer_llamacpp_claims_path(vectors_path: str) -> Optional[str]:
-    """Infer the *_claims_llamacpp.npy path from a *_concept_vectors_llamacpp.npy path."""
-    if not vectors_path:
-        return None
-
-    candidates = []
-    if "concept_vectors" in vectors_path:
-        candidates.append(vectors_path.replace("concept_vectors", "claims"))
-    # common pattern: <prefix>_concept_vectors_llamacpp.npy -> <prefix>_claims_llamacpp.npy
-    candidates.append(vectors_path.replace("_concept_vectors_", "_claims_"))
-
-    for p in candidates:
-        if p != vectors_path and os.path.exists(p):
-            return p
-    return None
-
-
-def _align_fever_dataset_to_llamacpp_claims(
-    dataset,
-    vectors: np.ndarray,
-    anno_claims: np.ndarray,
-    split_name: str,
-):
-    """Align FEVER jsonl rows to llama.cpp annotation order.
-
-    annotate_llamacpp.py saves:
-      - <prefix>_concept_vectors_llamacpp.npy (N, C)
-      - <prefix>_claims_llamacpp.npy (N,)
-
-    This function reorders/filters `dataset` to match `anno_claims` order and
-    drops any examples that can't be matched (with a warning).
-    """
-    if "claim" not in dataset.column_names:
-        raise ValueError(f"Expected a 'claim' column in {split_name} dataset. Found columns={dataset.column_names}")
-
-    ds_claims = dataset["claim"]
-    claim_to_indices = defaultdict(list)
-    for i, c in enumerate(ds_claims):
-        claim_to_indices[str(c)].append(i)
-
-    matched_ds_indices = []
-    matched_vec_indices = []
-
-    # Ensure we iterate over plain python strings.
-    anno_claims_list = [str(x) for x in np.asarray(anno_claims).tolist()]
-    for j, c in enumerate(anno_claims_list):
-        q = claim_to_indices.get(c)
-        if q:
-            matched_ds_indices.append(q.pop(0))
-            matched_vec_indices.append(j)
-
-    if len(matched_ds_indices) == 0:
-        raise ValueError(
-            f"Could not match any llama.cpp claims to {split_name} dataset claims. "
-            f"Check that --fever_*_jsonl corresponds to the same source used during annotation."
-        )
-
-    if len(matched_ds_indices) != len(anno_claims_list):
-        print(
-            f"WARNING: Only matched {len(matched_ds_indices)}/{len(anno_claims_list)} llama.cpp annotated claims "
-            f"to {split_name} jsonl rows. Unmatched annotations will be dropped."
-        )
-
-    dataset = dataset.select(matched_ds_indices)
-    vectors = np.asarray(vectors)[matched_vec_indices]
-    return dataset, vectors
-
-
-def _run_llamacpp_concept_cosine_eval(
-    preLM,
-    cbl,
-    test_loader,
-    eval_vectors: np.ndarray,
-    device,
-):
-    """Cosine-sim eval between predicted concepts and llama.cpp concept vectors (N, C)."""
-    if eval_vectors is None:
-        return {}
-
-    eval_vectors = np.asarray(eval_vectors, dtype=np.float32)
-    preds = []
-    for batch, _ in tqdm(test_loader, total=len(test_loader)):
-        batch = {k: v.to(device) for k, v in batch.items()}
-        with torch.no_grad():
-            features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state
-            concepts, _, _, _ = cbl(features.float())
-        pooled = eos_pooling(concepts, batch["attention_mask"]).detach().cpu()
-        preds.append(pooled)
-
-    preds = torch.cat(preds, dim=0)
-    labels = torch.tensor(eval_vectors, dtype=torch.float32)
-
-    # Align by length (we already aligned earlier when possible; this is a safe fallback).
-    n = min(preds.size(0), labels.size(0))
-    preds = preds[:n]
-    labels = labels[:n]
-
-    pred_norm = F.normalize(preds, p=2, dim=-1)
-    lab_norm = F.normalize(labels, p=2, dim=-1)
-    cos = (pred_norm * lab_norm).sum(dim=-1).mean().item()
-
-    print(f"Test concept cosine similarity vs llama.cpp vectors (raw): {cos:.4f}")
-    wandb.log({"test_concept_cosine_raw_llamacpp": float(cos)})
-    return {"test_concept_cosine_raw_llamacpp": float(cos)}
-
-
-def build_intervened_concepts_from_similarity(
-    concepts: torch.Tensor,
-    batch_sim: torch.Tensor,
-    intervention_value: float,
-    keep_other_concepts: bool,
-    use_topk: bool,
-    topk_k: int,
-    log_wandb: bool = False,
-    wandb_prefix: str = "train",
-) -> torch.Tensor:
-    """Construct an intervention concept tensor for `cbl.intervene`.
-
-        Current behavior (defaults):
-            - pick top-1 concept per example (argmax over batch_sim)
-            - set that concept to `intervention_value` for all time steps
-            - set all other concepts to 0
-
-        Optional strategies:
-            - keep_other_concepts=True: start from `concepts` and only overwrite targeted dims
-            - use_topk=True: stochastic top-K mode.
-                    For each example:
-                        1) take the top-K concepts by `batch_sim`
-                        2) softmax the K scores into probabilities
-                        3) sample a rank r ~ Categorical(probs)
-                        4) intervene on the top-(r+1) concepts (a prefix of the top-K)
-
-    Args:
-        concepts: (B, T, C)
-        batch_sim: (B, C)
-    """
-    if concepts.dim() != 3:
-        raise ValueError(f"Expected concepts to have shape (B, T, C); got {tuple(concepts.shape)}")
-    if batch_sim.dim() != 2:
-        raise ValueError(f"Expected batch_sim to have shape (B, C); got {tuple(batch_sim.shape)}")
-    if concepts.size(0) != batch_sim.size(0) or concepts.size(-1) != batch_sim.size(-1):
-        raise ValueError(
-            f"Shape mismatch: concepts {tuple(concepts.shape)} vs batch_sim {tuple(batch_sim.shape)}"
-        )
-
-    if keep_other_concepts:
-        intervened = concepts.detach().clone()
-    else:
-        intervened = torch.zeros_like(concepts)
-
-    value = float(intervention_value)
-    B = concepts.size(0)
-    C = concepts.size(-1)
-
-    if not use_topk:
-        indices = torch.argmax(batch_sim, dim=-1)  # (B,)
-        for b in range(B):
-            intervened[b, :, int(indices[b].item())] = value
-        return intervened
-
-    k = int(topk_k)
-    if k <= 0:
-        k = 1
-    k = min(k, C)
-
-    # Stochastic top-K cutoff selection per example.
-    sampled_ranks = []
-    sampled_probs = []
-    for b in range(B):
-        topk = torch.topk(batch_sim[b], k=k, dim=-1)
-        topk_scores = topk.values  # (k,)
-        topk_indices = topk.indices  # (k,)
-
-        probs = F.softmax(topk_scores, dim=-1)
-        sampled_rank = torch.multinomial(probs, num_samples=1).item()  # int in [0, k-1]
-        cutoff = int(sampled_rank) + 1
-        selected = topk_indices[:cutoff].tolist()
-
-        sampled_ranks.append(int(sampled_rank))
-        sampled_probs.append(float(probs[int(sampled_rank)].item()))
-
-        for idx in selected:
-            intervened[b, :, int(idx)] = value
-
-    if log_wandb and len(sampled_ranks) > 0 and wandb.run is not None:
-        # Log a small amount of debug info per training step.
-        # `sampled_rank` corresponds to choosing top-(rank+1) concepts among the top-K.
-        mean_rank = float(sum(sampled_ranks) / len(sampled_ranks))
-        mean_prob = float(sum(sampled_probs) / len(sampled_probs))
-        wandb.log(
-            {
-                f"{wandb_prefix}_intervention_topk_sampled_rank_b0": sampled_ranks[0],
-                f"{wandb_prefix}_intervention_topk_sampled_prob_b0": sampled_probs[0],
-                f"{wandb_prefix}_intervention_topk_sampled_rank_mean": mean_rank,
-                f"{wandb_prefix}_intervention_topk_sampled_prob_mean": mean_prob,
-            },
-            commit=False,
-        )
-    return intervened
-    
 
 parser = argparse.ArgumentParser()
 
@@ -383,13 +118,19 @@ parser.add_argument(
     help="K for --intervention_topk_concepts (default 3).",
 )
 
-parser.add_argument("--classifier_weight_suffixes", type=str, default="_seed42,_seed123,_seed456", 
-                    help="Comma-separated list of classifier weight suffixes to test (e.g., '_seed42,_seed123,_seed456')")
-parser.add_argument("--automatic_concept_correction", action='store_true', help="If set, automatically set concept labels to 0 for concepts that are not present in the example according to the ground truth label. This is a form of training intervention to correct mislabeled concepts.")
+
 parser.add_argument("--concept_loss_type", type=str, default="cosine_cubed", help="Type of concept loss to use: 'cosine_cubed' or 'ce'.")
 
 # Label sources
 parser.add_argument("--labeling", type=str, default="llamacpp", choices=["llamacpp", "mpnet", "angle", "simcse", "llm"], help="Concept label source")
+parser.add_argument(
+    "--use_class_concepts",
+    action="store_true",
+    help=(
+        "If set, ignore finegrained concept vectors/labels and instead train with 3 concepts that are the dataset classes "
+        "(FEVER: SUPPORTS/REFUTES/NOT ENOUGH INFO), using one-hot supervision derived from the `label` field."
+    ),
+)
 parser.add_argument(
     "--llamacpp_train_vectors",
     type=str,
@@ -400,7 +141,7 @@ parser.add_argument(
     "--llamacpp_train_claims",
     type=str,
     default="",
-    help="Optional path to *_claims_llamacpp.npy for FEVER train (if empty, inferred from --llamacpp_train_vectors when possible).",
+    help="Path to *_claims_llamacpp.npy for FEVER train (required when --labeling=llamacpp).",
 )
 parser.add_argument(
     "--llamacpp_val_vectors",
@@ -412,7 +153,7 @@ parser.add_argument(
     "--llamacpp_val_claims",
     type=str,
     default="",
-    help="Optional path to *_claims_llamacpp.npy for FEVER test/eval (if empty, inferred from --llamacpp_val_vectors when possible).",
+    help="Path to *_claims_llamacpp.npy for FEVER test/eval (required when --llamacpp_val_vectors is set).",
 )
 parser.add_argument(
     "--no_zero_out_nonclass_concepts",
@@ -438,27 +179,81 @@ parser.add_argument("--rm_model_name", type=str, default="Skywork/Skywork-Reward
 parser.add_argument("--rm_batch_size", type=int, default=0, help="0 = score all texts per chunk in one forward.")
 parser.add_argument("--rm_max_text_len", type=int, default=500)
 parser.add_argument("--skip_rm", action="store_true", help="Skip RM reward evaluation after training.")
+parser.add_argument(
+    "--skip_llamacpp_steer_eval",
+    action="store_true",
+    help="Skip llama.cpp judge-based steerability evaluation.",
+)
+parser.add_argument(
+    "--llamacpp_eval_model_repo_id",
+    type=str,
+    default="unsloth/Qwen3.5-27B-GGUF",
+    help="HF repo id for llama.cpp steerability judge.",
+)
+parser.add_argument(
+    "--llamacpp_eval_model_filename",
+    type=str,
+    default="Qwen3.5-27B-Q8_0.gguf",
+    help="GGUF filename for llama.cpp steerability judge.",
+)
+parser.add_argument(
+    "--llamacpp_eval_n_ctx",
+    type=int,
+    default=2048,
+    help="Context size for llama.cpp steerability judge.",
+)
+parser.add_argument(
+    "--llamacpp_eval_max_tokens",
+    type=int,
+    default=64,
+    help="Max tokens for llama.cpp judge output.",
+)
+parser.add_argument(
+    "--llamacpp_eval_repeat_penalty",
+    type=float,
+    default=1.15,
+    help="Repeat penalty for llama.cpp steerability judge.",
+)
+parser.add_argument(
+    "--llamacpp_eval_temperature",
+    type=float,
+    default=0.1,
+    help="Temperature for llama.cpp steerability judge.",
+)
 
 
 class ClassificationDataset(torch.utils.data.Dataset):
-    def __init__(self, encoded_text, s):
-        self.encoded_text = encoded_text
+    """Thin wrapper around a HF Dataset + numpy supervision array.
+
+    train_combined_finegrained.py previously assumed `encoded_text` was a dict of lists.
+    Here `encoded_text` is a `datasets.Dataset`, so we index per-row.
+    """
+
+    def __init__(self, encoded_dataset, s):
+        self.encoded_dataset = encoded_dataset
         self.s = s
 
-
     def __getitem__(self, idx):
-        t = {key: torch.tensor(values[idx]) for key, values in self.encoded_text.items()}
-        y = torch.FloatTensor(self.s[idx])
+        row = self.encoded_dataset[int(idx)]
+        t = {
+            "input_ids": torch.tensor(row["input_ids"], dtype=torch.long),
+            "attention_mask": torch.tensor(row["attention_mask"], dtype=torch.long),
+        }
+        y = torch.tensor(self.s[int(idx)], dtype=torch.float32)
         return t, y
 
     def __len__(self):
-        return len(self.encoded_text['input_ids'])
+        return len(self.encoded_dataset)
 
 
-def build_loaders(encoded_text, s, mode):
-    dataset = ClassificationDataset(encoded_text, s)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, num_workers=args.num_workers,
-                                             shuffle=True if mode == "train" else False)
+def build_loaders(encoded_dataset, s, mode):
+    dataset = ClassificationDataset(encoded_dataset, s)
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        shuffle=True if mode == "train" else False,
+    )
     return dataloader
 
 
@@ -492,33 +287,27 @@ if __name__ == "__main__":
     train_claims_np = None
     test_claims_np = None
 
-    if args.labeling == "llamacpp":
+    if args.labeling == "llamacpp" and (not args.use_class_concepts):
         print(f"Loading llama.cpp concept vectors from: {args.llamacpp_train_vectors}")
         train_similarity = np.load(args.llamacpp_train_vectors)
 
-        train_claims_path = args.llamacpp_train_claims.strip() or _infer_llamacpp_claims_path(args.llamacpp_train_vectors)
-        if train_claims_path and os.path.exists(train_claims_path):
-            print(f"Loading llama.cpp claims from: {train_claims_path}")
-            train_claims_np = np.load(train_claims_path, allow_pickle=True)
-            train_dataset, train_similarity = _align_fever_dataset_to_llamacpp_claims(
-                train_dataset, train_similarity, train_claims_np, split_name="train"
-            )
-        else:
-            print("[WARN] No *_claims_llamacpp.npy found for train; falling back to length-based truncation alignment.")
+        train_claims_path = args.llamacpp_train_claims
+        print(f"Loading llama.cpp claims from: {train_claims_path}")
+        train_claims_np = np.load(train_claims_path, allow_pickle=True)
+        train_dataset, train_similarity = _align_fever_dataset_to_llamacpp_claims(
+            train_dataset, train_similarity, train_claims_np, split_name="train"
+        )
 
         if args.llamacpp_val_vectors:
             print(f"Loading llama.cpp eval concept vectors from: {args.llamacpp_val_vectors}")
             test_similarity_llamacpp = np.load(args.llamacpp_val_vectors)
 
-            test_claims_path = args.llamacpp_val_claims.strip() or _infer_llamacpp_claims_path(args.llamacpp_val_vectors)
-            if test_claims_path and os.path.exists(test_claims_path):
-                print(f"Loading llama.cpp eval claims from: {test_claims_path}")
-                test_claims_np = np.load(test_claims_path, allow_pickle=True)
-                test_dataset, test_similarity_llamacpp = _align_fever_dataset_to_llamacpp_claims(
-                    test_dataset, test_similarity_llamacpp, test_claims_np, split_name="test"
-                )
-            else:
-                print("[WARN] No *_claims_llamacpp.npy found for test; falling back to length-based truncation alignment.")
+            test_claims_path = args.llamacpp_val_claims
+            print(f"Loading llama.cpp eval claims from: {test_claims_path}")
+            test_claims_np = np.load(test_claims_path, allow_pickle=True)
+            test_dataset, test_similarity_llamacpp = _align_fever_dataset_to_llamacpp_claims(
+                test_dataset, test_similarity_llamacpp, test_claims_np, split_name="test"
+            )
 
     print("training data len: ", len(train_dataset))
     print("test data len: ", len(test_dataset))
@@ -537,7 +326,9 @@ if __name__ == "__main__":
     tokenizer.pad_token = tokenizer.eos_token
 
     def _tok(batch):
-        return tokenizer(batch["claim"], padding=True, truncation=True, max_length=args.max_length)
+        # Use fixed-length padding so all rows share the same shape across map batches.
+        # This matches the original CB-LLMs assumption that tensors are stackable in the DataLoader.
+        return tokenizer(batch["claim"], padding="max_length", truncation=True, max_length=args.max_length)
 
     encoded_train_dataset = train_dataset.map(_tok, batched=True, batch_size=1024)
     encoded_test_dataset = test_dataset.map(_tok, batched=True, batch_size=1024)
@@ -548,22 +339,37 @@ if __name__ == "__main__":
     encoded_test_dataset = encoded_test_dataset.remove_columns([c for c in encoded_test_dataset.column_names if c not in keep_cols])
 
     concept_set = CFG.concept_set[args.dataset]
+    concept_set_for_similarity = concept_set
+    if args.use_class_concepts:
+        if args.dataset != "fever":
+            raise ValueError("--use_class_concepts is only supported for dataset='fever' in this script.")
+        # Keep short names for WandB keys / cache bookkeeping, but use descriptive holders
+        # for embedding-based similarity evaluation.
+        concept_set = CFG.FEVER_LABEL_NAMES
+        concept_set_for_similarity = CFG.FEVER_LABEL_CONCEPTS
     print("concept len: ", len(concept_set))  # concept_set: list of strings, len = num_concepts
 
     d_name = args.dataset.replace('/', '_')
     label_prefix = "./"
     val_similarity = None
 
-    # Concept labels
-    if args.labeling == "llamacpp":
+    # Concept labels / supervision vectors
+    # train_similarity must be shaped (N_train, C) where C == len(concept_set).
+    if args.use_class_concepts:
+        train_labels = np.asarray(encoded_train_dataset["label"], dtype=np.int64)
+        # Safety: clamp into [0, 2] in case of weird labels.
+        train_labels = np.clip(train_labels, 0, 2)
+        train_similarity = np.zeros((len(train_labels), 3), dtype=np.float32)
+        train_similarity[np.arange(len(train_labels)), train_labels] = 1.0
+        print("train_similarity shape (class one-hot): ", train_similarity.shape)
+    elif args.labeling == "llamacpp":
         # llama.cpp labels are direct concept vectors.
         label_prefix = os.path.dirname(os.path.abspath(args.llamacpp_train_vectors)) or "."
         if train_similarity is None:
             train_similarity = np.load(args.llamacpp_train_vectors)
         print("train_similarity shape: ", train_similarity.shape)
 
-        # Optional llama.cpp eval vectors (for post-training analysis). We'll align by truncation after tokenization
-        # if we couldn't align earlier via *_claims_llamacpp.npy.
+        # Optional llama.cpp eval vectors (for post-training analysis).
         val_similarity = test_similarity_llamacpp
         if val_similarity is not None:
             print("val/test_similarity(llamacpp) shape: ", val_similarity.shape)
@@ -582,13 +388,13 @@ if __name__ == "__main__":
         train_similarity = np.load(label_prefix + "/concept_labels_train.npy")  # (N_train, num_concepts)
         print("train_similarity shape: ", train_similarity.shape)
 
-    # Align label matrices with the encoded datasets (length-based fallback).
-    train_similarity, encoded_train_dataset = _align_similarity_and_encoded(
-        train_similarity, encoded_train_dataset, split_name="train"
+    # Require exact alignment between concept-label rows and tokenized dataset rows.
+    assert int(np.asarray(train_similarity).shape[0]) == len(encoded_train_dataset), (
+        f"train: concept-label rows ({int(np.asarray(train_similarity).shape[0])}) != tokenized dataset rows ({len(encoded_train_dataset)})"
     )
     if val_similarity is not None:
-        val_similarity, encoded_test_dataset = _align_similarity_and_encoded(
-            val_similarity, encoded_test_dataset, split_name="test"
+        assert int(np.asarray(val_similarity).shape[0]) == len(encoded_test_dataset), (
+            f"test: concept-label rows ({int(np.asarray(val_similarity).shape[0])}) != tokenized dataset rows ({len(encoded_test_dataset)})"
         )
 
     # Basic shape sanity checks.
@@ -598,7 +404,7 @@ if __name__ == "__main__":
             f"Check concept vectors / labels and config_finegrained.concept_set for {args.dataset}."
         )
 
-    if args.dataset == "fever" and (not args.no_zero_out_nonclass_concepts):
+    if args.dataset == "fever" and (not args.no_zero_out_nonclass_concepts) and (not args.use_class_concepts):
         start = time.time()
         print("Applying FEVER label-based concept masking (zeroing non-class concepts)...")
         train_labels = np.asarray(encoded_train_dataset["label"])
@@ -613,7 +419,7 @@ if __name__ == "__main__":
     train_loader = build_loaders(encoded_train_dataset, train_similarity, mode="train")
 
     # test_loader is used for post-training analyses; it does not require labels.
-    test_similarity = np.zeros((len(encoded_test_dataset["label"]), 1), dtype=np.float32)
+    test_similarity = np.zeros((len(encoded_test_dataset["label"]), len(concept_set)), dtype=np.float32)
     test_loader = build_loaders(encoded_test_dataset, test_similarity, mode="test")
 
     print("preparing backbone")
@@ -902,8 +708,23 @@ if __name__ == "__main__":
     )
 
     # ── Concept accuracy ──
-    # MPNet/ACS-style evaluation (requires concept_labels_test.npy). Kept for non-llamacpp label sources.
-    run_concept_accuracy_cosine(preLM, cbl, test_loader, concept_set, label_prefix, device)
+    test_similarity_eval = None
+    if args.use_class_concepts:
+        test_labels = np.asarray(encoded_test_dataset["label"], dtype=np.int64)
+        test_labels = np.clip(test_labels, 0, len(concept_set) - 1)
+        test_similarity_eval = np.zeros((len(test_labels), len(concept_set)), dtype=np.float32)
+        test_similarity_eval[np.arange(len(test_labels)), test_labels] = 1.0
+
+    run_concept_accuracy_cosine(
+        preLM,
+        cbl,
+        test_loader,
+        concept_set,
+        label_prefix,
+        device,
+        test_similarity_np=test_similarity_eval,
+        llama_vocab_weight=llama_vocab_weight,
+    )
 
     # If provided, evaluate against llama.cpp vectors directly.
     if args.labeling == "llamacpp" and val_similarity is not None:
@@ -924,11 +745,29 @@ if __name__ == "__main__":
     # ── Steerability scoring (MPNet similarity) ──
     if not args.skip_mpnet_eval and args.labeling != "llamacpp":
         run_steerability_mpnet(
-            decoded_texts_by_concept, concept_set,
+            decoded_texts_by_concept, concept_set_for_similarity,
             intervention_value, args.max_length, device,
         )
     else:
         print("Skipping MPNet steerability evaluation.")
+
+    # ── Steerability scoring (llama.cpp judge) ──
+    if not args.skip_llamacpp_steer_eval:
+        try:
+            run_steerability_llamacpp_judge(
+                decoded_texts_by_concept=decoded_texts_by_concept,
+                concept_set=concept_set,
+                model_repo_id=args.llamacpp_eval_model_repo_id,
+                model_filename=args.llamacpp_eval_model_filename,
+                n_ctx=args.llamacpp_eval_n_ctx,
+                max_tokens=args.llamacpp_eval_max_tokens,
+                repeat_penalty=args.llamacpp_eval_repeat_penalty,
+                temperature=args.llamacpp_eval_temperature,
+            )
+        except Exception as llama_eval_err:
+            print(f"llama.cpp steerability evaluation failed (non-fatal): {llama_eval_err}")
+    else:
+        print("Skipping llama.cpp steerability evaluation.")
 
     # ── Perplexity computation (evaluate library loads its own LLM) ──
     compute_perplexity(ppl_texts)

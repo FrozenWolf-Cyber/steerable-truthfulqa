@@ -14,12 +14,18 @@ from __future__ import annotations
 
 import gc
 import glob
+import json
 import os
 import pickle
+import re
+import subprocess
+import sys
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 import evaluate
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
 import wandb
@@ -84,6 +90,272 @@ def release_llama_vocab_weight():
 
 def get_intervention_value(dataset: str) -> int:
     return 150 if dataset == "dbpedia_14" else 100
+
+
+TRUTHFULQA_INTERVENTION_CONCEPTS = {
+    "8concept": {
+        "best_single": 7,
+        "evidence": 0,
+        "combined": [0, 7],
+    },
+    "3concept": {
+        "supports": 0,
+        "nei": 2,
+    },
+}
+
+
+def _normalize_intervention_goals(
+    intervention_goals: Optional[dict],
+    use_class_concepts: bool,
+    num_concepts: int,
+) -> dict[str, list[int]]:
+    goals = intervention_goals
+    if goals is None:
+        key = "3concept" if use_class_concepts else "8concept"
+        goals = TRUTHFULQA_INTERVENTION_CONCEPTS.get(key, {})
+
+    normalized: dict[str, list[int]] = {}
+    for goal_name, raw_indices in goals.items():
+        if isinstance(raw_indices, int):
+            idxs = [raw_indices]
+        else:
+            idxs = list(raw_indices)
+
+        clean = []
+        for idx in idxs:
+            i = int(idx)
+            if 0 <= i < num_concepts:
+                clean.append(i)
+            else:
+                print(f"[WARN] Skipping out-of-range concept idx={i} for goal '{goal_name}'.")
+        if clean:
+            normalized[goal_name] = sorted(set(clean))
+        else:
+            print(f"[WARN] Goal '{goal_name}' has no valid concept indices; skipping.")
+    return normalized
+
+
+def _format_truthfulqa_prompt(tokenizer, question: str, system_prompt: str) -> str:
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": question},
+    ]
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        continue_final_message=False,
+    )
+
+
+@torch.no_grad()
+def _generate_truthfulqa_answer(
+    preLM,
+    cbl,
+    tokenizer,
+    question: str,
+    system_prompt: str,
+    device,
+    intervene: Optional[list[float]] = None,
+    max_new_tokens: int = 50,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+    top_k: int = 100,
+    repetition_penalty: float = 1.1,
+    keep_other_concepts: bool = False,
+    llama_vocab_weight=None,
+) -> str:
+    prompt = _format_truthfulqa_prompt(tokenizer, question, system_prompt)
+    encoded = tokenizer(prompt, return_tensors="pt").to(device)
+    prompt_ids = encoded["input_ids"]
+    prompt_len = prompt_ids.shape[1]
+
+    gen_ids, _ = cbl.generate_batch(
+        prompt_ids,
+        preLM,
+        num_samples=1,
+        intervene=intervene,
+        length=max_new_tokens,
+        temp=temperature,
+        topk=top_k,
+        topp=top_p,
+        repetition_penalty=repetition_penalty,
+        keep_other_concepts=keep_other_concepts,
+        llama_vocab_weight=llama_vocab_weight,
+    )
+    completion_ids = gen_ids[0, prompt_len:]
+    text = tokenizer.decode(completion_ids, skip_special_tokens=True)
+    return text.split("\nQ:")[0].strip()
+
+
+def run_truthfulqa_evaluation_for_cbm(
+    preLM,
+    cbl,
+    tokenizer,
+    concept_set: Sequence[str],
+    seed: int = 42,
+    batch_size: int = 10,
+    model_label: str = "CBM-Llama3",
+    layer_idx: int = -1,
+    run_id: Optional[str] = None,
+    use_class_concepts: bool = False,
+    intervention_goals: Optional[dict] = None,
+    intervention_value: Optional[float] = None,
+    keep_other_concepts: bool = False,
+    max_new_tokens: int = 50,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+    top_k: int = 100,
+    repetition_penalty: float = 1.1,
+    data_dir: Optional[str] = None,
+    results_root: Optional[str] = None,
+    llama_vocab_weight=None,
+    display: bool = True,
+):
+    """Run TruthfulQA generation + judge evaluation for CBM checkpoints.
+
+    Generates:
+      - normal forward pass outputs
+      - intervention outputs for all configured intervention goals
+    Writes JSONL in the same schema as run_baselines.py, then evaluates with
+    truthful_qa/truthfulqa_evaluate.py and logs metrics to wandb.
+    """
+    from data_prep import load_questions
+    from truthfulqa_evaluate import evaluate_from_jsonl_list
+    from config import TRUTHFULQA_SYSTEM_PROMPT, DEFAULT_CHAT_TEMPLATE
+
+    # Match baseline behaviour: ensure we have a deterministic chat template even
+    # when the tokenizer doesn't ship one.
+    if getattr(tokenizer, "chat_template", None) is None:
+        tokenizer.chat_template = DEFAULT_CHAT_TEMPLATE
+
+    preLM.eval()
+    cbl.eval()
+    set_seed(seed)
+
+    if run_id is None:
+        run_id = wandb.run.id if wandb.run is not None else "norun"
+    if intervention_value is None:
+        intervention_value = 100.0
+
+    concept_dim = len(concept_set)
+    goal_map = _normalize_intervention_goals(
+        intervention_goals=intervention_goals,
+        use_class_concepts=use_class_concepts,
+        num_concepts=concept_dim,
+    )
+
+    variants: list[tuple[str, Optional[list[int]]]] = [("normal", None)]
+    variants.extend((goal_name, idxs) for goal_name, idxs in goal_map.items())
+
+    base_root = Path(results_root) if results_root else (Path(__file__).parent / "results" / "truthfulqa")
+    raw_dir = base_root / "raw_outputs_cbm" / model_label
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    eval_csv = (
+        base_root
+        / "eval_results"
+        / "stat_results"
+        / f"{model_label}-l{layer_idx}-TruthfulQA-seed{seed}-wandb{run_id}.csv"
+    )
+    eval_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    data_path = Path(data_dir) if data_dir is not None else None
+    all_jsonls: list[Path] = []
+
+    print(f"Running TruthfulQA eval for {model_label} (wandb={run_id}, seed={seed})")
+    print(f"Intervention variants: {[v[0] for v in variants]}")
+
+    for variant_name, concept_idxs in variants:
+        # Re-seed per variant so normal vs intervention comparisons are not confounded by RNG drift.
+        set_seed(seed)
+
+        generator = f"{model_label}-l{layer_idx}-CBM-{variant_name}-wandb{run_id}"
+        fname = f"{model_label}-l{layer_idx}-CBM-{variant_name}-TruthfulQA-seed{seed}-wandb{run_id}.jsonl"
+        out_path = raw_dir / fname
+
+        if out_path.exists():
+            print(f"✓ Output file exists, skipping generation: {out_path.name}")
+            all_jsonls.append(out_path)
+            continue
+
+        all_rows = []
+        for split_idx in [0, 1]:
+            questions = load_questions(split_idx, data_dir=data_path)
+            print(f"[TruthfulQA:{variant_name}] split={split_idx} questions={len(questions)}")
+            for q in tqdm(questions, desc=f"TruthfulQA {variant_name} split{split_idx}", disable=not display):
+                intervene_vec = None
+                if concept_idxs is not None:
+                    intervene_vec = [0.0] * concept_dim
+                    for ci in concept_idxs:
+                        intervene_vec[ci] = float(intervention_value)
+
+                output_text = _generate_truthfulqa_answer(
+                    preLM=preLM,
+                    cbl=cbl,
+                    tokenizer=tokenizer,
+                    question=q,
+                    system_prompt=TRUTHFULQA_SYSTEM_PROMPT,
+                    device=next(preLM.parameters()).device,
+                    intervene=intervene_vec,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repetition_penalty=repetition_penalty,
+                    keep_other_concepts=keep_other_concepts,
+                    llama_vocab_weight=llama_vocab_weight,
+                )
+                all_rows.append({
+                    "prompt": q,
+                    "output": output_text,
+                    "generator": generator,
+                    "dataset": "TruthfulQA",
+                    "model": model_label,
+                    "layer_idx": layer_idx,
+                    "seed": seed,
+                    "run_id": run_id,
+                    "variant": variant_name,
+                    "intervened_concepts": concept_idxs if concept_idxs is not None else [],
+                })
+
+        with open(out_path, "w", encoding="utf-8") as f:
+            for row in all_rows:
+                f.write(json.dumps(row) + "\n")
+        print(f"Saved {len(all_rows)} TruthfulQA rows -> {out_path}")
+        all_jsonls.append(out_path)
+
+    eval_df = evaluate_from_jsonl_list(
+        jsonl_paths=all_jsonls,
+        eval_csv_path=eval_csv,
+        batch_size=batch_size,
+        display=display,
+        seed=seed,
+    )
+
+    if isinstance(eval_df, pd.DataFrame) and not eval_df.empty and wandb.run is not None:
+        for _, row in eval_df.iterrows():
+            generator = str(row["Steering Method"])
+            safe_name = generator.replace("/", "_")
+            wandb.log({
+                f"truthfulqa/{safe_name}/true_info": float(row["True * Info"]),
+                f"truthfulqa/{safe_name}/truthfulness": float(row["Truthfulness"]),
+                f"truthfulqa/{safe_name}/informativeness": float(row["Informativeness"]),
+                f"truthfulqa/{safe_name}/perplexity": float(row["Perplexity"]),
+                f"truthfulqa/{safe_name}/dist1": float(row["Dist-1"]),
+                f"truthfulqa/{safe_name}/dist2": float(row["Dist-2"]),
+                f"truthfulqa/{safe_name}/dist3": float(row["Dist-3"]),
+            })
+        wandb.log({
+            "truthfulqa_eval_csv": str(eval_csv),
+            "truthfulqa_num_variants": len(variants),
+        })
+
+    return {
+        "jsonl_paths": [str(p) for p in all_jsonls],
+        "eval_csv_path": str(eval_csv),
+        "variants": [name for name, _ in variants],
+    }
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -521,6 +793,154 @@ def run_steerability_mpnet(
 
 
 # ═══════════════════════════════════════════════════════════════
+# Steerability Evaluation: llama.cpp Judge (annotate_llamacpp style)
+# ═══════════════════════════════════════════════════════════════
+
+def _llamacpp_build_raw_prompt(text: str, concepts: list[str]) -> str:
+    im_start = "<|im_start|>"
+    im_end = "<|im_end|>"
+    nl = "\n"
+    system_text = (
+        "You are a strict classifier. "
+        "Output ONLY a single line containing exactly one label copied verbatim from OPTIONS. "
+        "No explanation, no preamble, no bullets."
+    )
+    assistant_prefill = "<think>\n\n</think>\n\n"
+    opts_block = "\n".join(f"- {c}" for c in concepts)
+    user_text = (
+        "Choose the single closest label from OPTIONS for the GENERATED_TEXT.\n\n"
+        f"OPTIONS:\n{opts_block}\n\n"
+        f"GENERATED_TEXT:\n{text}\n\n"
+        "Answer (one label verbatim from OPTIONS, nothing else):"
+    )
+    return (
+        f"{im_start}system{nl}{system_text}{im_end}{nl}"
+        f"{im_start}user{nl}{user_text}{im_end}{nl}"
+        f"{im_start}assistant{nl}{assistant_prefill}"
+    )
+
+
+def _llamacpp_parse_output(output: str, concepts: list[str]) -> str:
+    first_line = next((ln.strip() for ln in str(output).splitlines() if ln.strip()), "")
+    if not first_line:
+        return concepts[0]
+
+    parts = [p.strip() for p in re.split(r"[,;]", first_line) if p.strip()]
+    if not parts:
+        parts = [first_line]
+
+    for p in parts:
+        if p in concepts:
+            return p
+        m = next((c for c in concepts if c.lower() == p.lower()), None)
+        if m is not None:
+            return m
+        for c in concepts:
+            if p.lower() in c.lower() or c.lower() in p.lower():
+                return c
+    return concepts[0]
+
+
+def run_steerability_llamacpp_judge(
+    decoded_texts_by_concept,
+    concept_set,
+    model_repo_id="unsloth/Qwen3.5-27B-GGUF",
+    model_filename="Qwen3.5-27B-Q8_0.gguf",
+    n_ctx=2048,
+    max_tokens=64,
+    repeat_penalty=1.15,
+    temperature=0.1,
+):
+    """Judge steerability by classifying generated text to closest concept with llama.cpp."""
+    try:
+        from llama_cpp import Llama
+    except Exception as e:
+        print(f"[WARN] llama_cpp import failed: {e}")
+        print('Attempting install: CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python')
+        try:
+            env = os.environ.copy()
+            env["CMAKE_ARGS"] = "-DGGML_CUDA=on"
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "llama-cpp-python"],
+                env=env,
+            )
+            from llama_cpp import Llama
+            print("Successfully installed/imported llama_cpp.")
+        except Exception as install_err:
+            print(
+                "[WARN] Failed to install/import llama_cpp after retry; "
+                f"skipping llama.cpp steerability eval: {install_err}"
+            )
+            return {}
+
+    print(
+        f"Loading llama.cpp judge | repo={model_repo_id} file={model_filename} "
+        f"n_ctx={n_ctx} max_tokens={max_tokens} temp={temperature}"
+    )
+    llm = Llama.from_pretrained(
+        repo_id=model_repo_id,
+        filename=model_filename,
+        n_gpu_layers=-1,
+        n_ctx=n_ctx,
+        verbose=False,
+    )
+
+    total = 0
+    correct = 0
+    raw_outputs = []
+
+    for target_idx, texts in enumerate(tqdm(decoded_texts_by_concept, desc="Steerability llama.cpp judging")):
+        for sample_idx, text in enumerate(texts):
+            prompt = _llamacpp_build_raw_prompt(text, concept_set)
+            try:
+                out = llm(
+                    prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=0.9,
+                    top_k=40,
+                    repeat_penalty=repeat_penalty,
+                    stop=["<|im_end|>", "<|im_start|>", "\n\n"],
+                )
+                raw = out["choices"][0]["text"] if out and out.get("choices") else ""
+            except Exception as e:
+                print(f"[WARN] llama.cpp judge failed at concept={target_idx} sample={sample_idx}: {e}")
+                raw = ""
+
+            pred_label = _llamacpp_parse_output(raw, concept_set)
+            pred_idx = concept_set.index(pred_label) if pred_label in concept_set else 0
+            is_correct = int(pred_idx == target_idx)
+            correct += is_correct
+            total += 1
+
+            raw_outputs.append(
+                {
+                    "target_idx": int(target_idx),
+                    "target_label": concept_set[target_idx],
+                    "sample_idx": int(sample_idx),
+                    "pred_label": pred_label,
+                    "raw_output": raw,
+                }
+            )
+            wandb.log(
+                {
+                    f"steerability_llamacpp_pred_{target_idx}_{sample_idx}": pred_label,
+                    f"steerability_llamacpp_correct_{target_idx}_{sample_idx}": is_correct,
+                }
+            )
+
+    acc = (correct / total) if total > 0 else 0.0
+    metrics = {
+        "steerability_llamacpp_judge_accuracy": float(acc),
+        "steerability_llamacpp_judge_total": int(total),
+    }
+    print(f"  steerability_llamacpp_judge_accuracy: {acc:.4f} ({correct}/{total})")
+    wandb.log(metrics)
+
+    return {"metrics": metrics, "raw_outputs": raw_outputs}
+
+
+# ═══════════════════════════════════════════════════════════════
 # Concept Accuracy: Hard Labels (train_combined.py style)
 # ═══════════════════════════════════════════════════════════════
 
@@ -550,9 +970,28 @@ def run_concept_accuracy_labels(preLM, cbl, test_loader, concept_set, encoded_te
 # Concept Accuracy: Cosine Similarity (train_combined_finegrained.py style)
 # ═══════════════════════════════════════════════════════════════
 
-def run_concept_accuracy_cosine(preLM, cbl, test_loader, concept_set, label_prefix, device):
-    """Concept prediction accuracy using cosine similarity to ACS labels. Returns dict."""
-    print("eval concepts (cosine similarity to MPNet labels)...")
+def run_concept_accuracy_cosine(
+    preLM,
+    cbl,
+    test_loader,
+    concept_set,
+    label_prefix,
+    device,
+    test_similarity_np=None,
+    llama_vocab_weight=None,
+):
+    """Concept prediction evaluation using cosine similarity to target concept vectors.
+
+    - Default behavior (backwards compatible): load targets from ``label_prefix/concept_labels_test.npy``.
+    - If ``test_similarity_np`` is provided, use it directly (e.g., one-hot class concepts) and skip disk loading.
+
+    Args:
+        test_similarity_np: Optional array-like of shape (N, C).
+        llama_vocab_weight: Optional tensor (vocab_size, hidden_dim). If provided, compute llama logits from
+            backbone hidden states and pass them into ``cbl(..., llama_logits=...)`` (for --add_llama_logits).
+    """
+    print("eval concepts (cosine similarity)...")
+
     concept_predictions = []
     for batch, _ in tqdm(test_loader, total=len(test_loader)):
         batch = {k: v.to(device) for k, v in batch.items()}
@@ -560,18 +999,23 @@ def run_concept_accuracy_cosine(preLM, cbl, test_loader, concept_set, label_pref
             features = preLM(
                 input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
             ).last_hidden_state
-            concepts, _, _, _ = cbl(features.float())
+            llama_logits = F.linear(features, llama_vocab_weight) if llama_vocab_weight is not None else None
+            if llama_logits is not None:
+                concepts, _, _, _ = cbl(features.float(), llama_logits=llama_logits)
+            else:
+                concepts, _, _, _ = cbl(features.float())
         pooled_concepts = eos_pooling(concepts, batch["attention_mask"])
         concept_predictions.append(pooled_concepts.detach().cpu())
     concept_predictions = torch.cat(concept_predictions, dim=0)
 
-    test_sim_path = os.path.join(label_prefix, "concept_labels_test.npy")
-    if not os.path.exists(test_sim_path):
-        print(f"[WARN] {test_sim_path} not found. Skipping cosine concept evaluation.")
-        return {}
+    if test_similarity_np is None:
+        test_sim_path = os.path.join(label_prefix, "concept_labels_test.npy")
+        if not os.path.exists(test_sim_path):
+            print(f"[WARN] {test_sim_path} not found. Skipping cosine concept evaluation.")
+            return {}
+        test_similarity_np = np.load(test_sim_path)
 
-    test_similarity_np = np.load(test_sim_path)
-    test_similarity = torch.tensor(test_similarity_np, dtype=torch.float32)
+    test_similarity = torch.tensor(np.asarray(test_similarity_np), dtype=torch.float32)
 
     if test_similarity.shape != concept_predictions.shape:
         print(

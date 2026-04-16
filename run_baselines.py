@@ -6,7 +6,7 @@ Replicates the exact same pipeline as ODESteer's truthfulqa_generate.py:
   - 2-fold cross-validation (train on split 0, test on split 1, then swap)
   - Fit steering model on train-split activations
   - Generate answers to test-split questions with steering applied
-  - Save outputs in standard jsonl format for evaluate.py
+  - Save outputs in standard jsonl format for truthfulqa_evaluate.py
 
 Usage:
   # Run a single method:
@@ -164,6 +164,7 @@ def build_pace_cfg(layer_idx: int, args) -> dict:
         "alpha": args.pace_alpha,
         "layer_idx": layer_idx,
         "pace_gpu": args.pace_gpu,
+        "pace_token_timing": args.pace_token_timing,
     }
 
 
@@ -191,6 +192,8 @@ def main():
     parser.add_argument("--pace_alpha", type=float, default=1.0)
     parser.add_argument("--pace_gpu", action="store_true",
                         help="Run PaCE sparse decomposition on GPU (faster, may slightly change outputs).")
+    parser.add_argument("--pace_token_timing", action="store_true",
+                        help="Print per (batch, seq) position PaCE timings during generation (verbose).")
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir) if args.data_dir else None
@@ -212,7 +215,7 @@ def main():
             )
 
         if args.evaluate:
-            from evaluate import evaluate_outputs
+            from truthfulqa_evaluate import evaluate_outputs
             raw_dir = RESULTS_DIR / "raw_outputs"
             eval_path = (
                 RESULTS_DIR / "eval_results" / "stat_results"
