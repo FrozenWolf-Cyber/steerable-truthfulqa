@@ -128,16 +128,26 @@ class ConceptDictionary:
 
         self.concepts: List[str] = []
         self.representations: List[List[str]] = []
+        skipped_empty = 0
 
         for concept in all_concepts:
             rep_file = self.representation_path / f"{concept}.txt"
             if rep_file.exists():
                 with open(rep_file, "r") as rf:
                     rep = ast.literal_eval(rf.read())
+                valid_rep = [r for r in rep if isinstance(r, str) and r.strip()]
+                if not valid_rep:
+                    skipped_empty += 1
+                    continue
                 self.concepts.append(concept)
-                self.representations.append(rep)
+                self.representations.append(valid_rep)
 
-        logger.info("ConceptDictionary: loaded %d / %d concepts", len(self.concepts), len(all_concepts))
+        logger.info(
+            "ConceptDictionary: loaded %d / %d concepts (skipped_empty=%d)",
+            len(self.concepts),
+            len(all_concepts),
+            skipped_empty,
+        )
 
     def __len__(self) -> int:
         return len(self.concepts)
@@ -209,6 +219,10 @@ class ActivationConceptEncoder:
         self.device = next(model.parameters()).device
 
     def _encode_contexts(self, contexts: List[str]) -> torch.Tensor:
+        contexts = [c for c in contexts if isinstance(c, str) and c.strip()]
+        if not contexts:
+            raise ValueError("PaCE concept has no valid contexts after filtering.")
+
         vectors = []
         for i in range(0, len(contexts), self.batch_size):
             batch = contexts[i : i + self.batch_size]
@@ -219,9 +233,11 @@ class ActivationConceptEncoder:
             with torch.no_grad():
                 out = self.model(**enc, output_hidden_states=True, return_dict=True)
             hs = out.hidden_states[self.layer_idx + 1]
-            seq_lens = enc["attention_mask"].sum(dim=1) - 1
+            seq_lens = (enc["attention_mask"].sum(dim=1) - 1).clamp_min(0)
             for b_idx, s_len in enumerate(seq_lens):
                 vectors.append(hs[b_idx, s_len].cpu())
+        if not vectors:
+            raise RuntimeError("PaCE failed to encode any vectors from non-empty contexts.")
         return torch.stack(vectors).mean(dim=0)
 
     def get_concept_vector(self, concept: str, contexts: List[str]) -> torch.Tensor:
