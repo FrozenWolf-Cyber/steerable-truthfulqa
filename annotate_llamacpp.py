@@ -128,12 +128,14 @@ TASK:
 Given the CLAIM below, select ALL applicable labels from OPTIONS.
 
 OUTPUT RULES (mandatory):
-1. Be concise: at most a few short sentences of reasoning (or none). Do NOT write long essays, "Thinking Process:" sections, or numbered analysis—keep everything before the final line minimal.
+1. Limit thinking/reasoning to at most 5 short lines total before the final answer line. Do NOT write long essays, "Thinking Process:" sections, or numbered analysis.
 2. The VERY LAST non-empty line of your entire reply MUST be your only machine-readable answer.
 3. That final line MUST contain NOTHING except labels taken verbatim from OPTIONS (copy the full text exactly as written under OPTIONS).
 4. Separate multiple labels with a comma followed by a space: ", "
 5. Do NOT number labels, do NOT use "Option 1/2", do NOT add quotes, bullets, or extra words on that final line.
 6. Regex target: ^(<exact option text>(, <exact option text>)*)$
+7. Example final line format:
+   claim directly supported by verifiable documented evidence, claim with explicit attribution to a named source or study
 
 OPTIONS:
 {opts_block}
@@ -141,7 +143,7 @@ OPTIONS:
 CLAIM:
 {claim}
 
-Prefer zero or one brief sentence of rationale, then end: your last line must be ONLY comma-separated labels copied from OPTIONS.""".strip()
+Be concise, keep reasoning <=5 lines, then end: your last line must be ONLY comma-separated labels copied from OPTIONS.""".strip()
 
 
 # =========================
