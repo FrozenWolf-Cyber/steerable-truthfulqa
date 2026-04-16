@@ -1,22 +1,20 @@
 import argparse
 import os
-import json
 import time
 from collections import defaultdict
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
 import numpy as np
 import evaluate
 from tqdm.auto import tqdm
-from datasets import load_dataset, Dataset
 
 import config_finegrained as CFG
 from transformers import LlamaConfig, LlamaModel, AutoTokenizer, RobertaTokenizerFast, AutoModel, AutoModelForCausalLM
 from peft import LoraConfig, TaskType, get_peft_model
 from modules import CBLResidual, CBL, Roberta_classifier
-from utils import elastic_net_penalty, mean_pooling, eos_pooling, cos_sim_cubed
+from utils import elastic_net_penalty, mean_pooling, eos_pooling, cos_sim_cubed, load_jsonl_as_dataset
 from steerability_cache import save_all_steerability_texts, steerability_output_root
 from eval_metrics import (
     set_seed,
@@ -47,37 +45,6 @@ def _normalize_fever_label(label):
         return 1
     return 2
 
-
-def _load_dataset_with_config(dataset: str, split: str, dataset_config=None):
-    """Load HF dataset, supporting datasets that require a config like FEVER."""
-    if dataset == "fever":
-        cfg = dataset_config or "v1.0"
-        return load_dataset("fever", cfg, split=split)
-    return load_dataset(dataset, split=split)
-
-
-def _load_jsonl_as_dataset(jsonl_path: str, max_samples: int = 0):
-    """Load a local JSONL file into a HF Dataset, preserving file order.
-
-    This matches annotate_llamacpp.py's behavior (read line-by-line json.loads).
-    """
-    if not os.path.exists(jsonl_path):
-        raise FileNotFoundError(f"JSONL not found: {jsonl_path}")
-
-    rows = []
-    with open(jsonl_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rows.append(json.loads(line))
-            if max_samples and max_samples > 0 and len(rows) >= int(max_samples):
-                break
-
-    if len(rows) == 0:
-        raise ValueError(f"No rows found in JSONL: {jsonl_path}")
-
-    return Dataset.from_list(rows)
 
 
 def _apply_fever_concept_mask(similarity: np.ndarray, labels: np.ndarray) -> np.ndarray:
@@ -512,8 +479,8 @@ if __name__ == "__main__":
     print("loading FEVER jsonl...")
 
     # Load jsonl exactly like annotate_llamacpp.py (preserve file order; optional truncation).
-    train_dataset = _load_jsonl_as_dataset(args.fever_train_jsonl, max_samples=args.fever_max_train_samples)
-    test_dataset = _load_jsonl_as_dataset(args.fever_test_jsonl, max_samples=args.fever_max_test_samples)
+    train_dataset = load_jsonl_as_dataset(args.fever_train_jsonl, max_samples=args.fever_max_train_samples)
+    test_dataset = load_jsonl_as_dataset(args.fever_test_jsonl, max_samples=args.fever_max_test_samples)
 
     # Ensure FEVER labels are ints: 0=SUPPORTS, 1=REFUTES, 2=NEI.
     train_dataset = train_dataset.map(lambda e: {"label": _normalize_fever_label(e.get("label", 2))})

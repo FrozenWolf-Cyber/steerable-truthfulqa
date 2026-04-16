@@ -28,6 +28,18 @@ def parse_args():
         default=4096,
         help="Max new tokens per generation (raise if the model stops mid 'thinking' before the final label line).",
     )
+    p.add_argument(
+        "--repeat-penalty",
+        type=float,
+        default=1.1,
+        help="Repetition penalty for generation (1.0 disables).",
+    )
+    p.add_argument(
+        "--reasoning-budget",
+        type=int,
+        default=5,
+        help="llama.cpp reasoning_budget generation argument.",
+    )
     return p.parse_args()
 
 
@@ -45,7 +57,13 @@ if ARGS.restart and os.path.isfile(CHECKPOINT_PATH):
     os.remove(CHECKPOINT_PATH)
     print(f"Removed checkpoint (--restart): {CHECKPOINT_PATH}")
 
-print(f"Loading model: n_ctx={ARGS.n_ctx}, max_new_tokens={ARGS.max_tokens}")
+print(
+    "Loading model: "
+    f"n_ctx={ARGS.n_ctx}, "
+    f"max_new_tokens={ARGS.max_tokens}, "
+    f"repeat_penalty={ARGS.repeat_penalty}, "
+    f"reasoning_budget={ARGS.reasoning_budget}"
+)
 
 llm = Llama.from_pretrained(
     repo_id=MODEL_REPO_ID,
@@ -128,7 +146,7 @@ TASK:
 Given the CLAIM below, select ALL applicable labels from OPTIONS.
 
 OUTPUT RULES (mandatory):
-1. Limit thinking/reasoning to at most 5 short lines total before the final answer line. Do NOT write long essays, "Thinking Process:" sections, or numbered analysis.
+1. Keep it as concise and straight as possible.
 2. The VERY LAST non-empty line of your entire reply MUST be your only machine-readable answer.
 3. That final line MUST contain NOTHING except labels taken verbatim from OPTIONS (copy the full text exactly as written under OPTIONS).
 4. Separate multiple labels with a comma followed by a space: ", "
@@ -143,7 +161,7 @@ OPTIONS:
 CLAIM:
 {claim}
 
-Be concise, keep reasoning <=5 lines, then end: your last line must be ONLY comma-separated labels copied from OPTIONS.""".strip()
+Keep it concise and straight, then end: your last line must be ONLY comma-separated labels copied from OPTIONS.""".strip()
 
 
 # =========================
@@ -159,6 +177,8 @@ def call_model(prompt):
         top_p=0.8,
         top_k=20,
         min_p=0.0,
+        reasoning_budget=ARGS.reasoning_budget,
+        repeat_penalty=ARGS.repeat_penalty,
         max_tokens=ARGS.max_tokens,
     )
     raw = response["choices"][0]["message"]["content"]

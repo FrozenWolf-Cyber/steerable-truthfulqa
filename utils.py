@@ -87,3 +87,37 @@ def normalize(x, d=-1, mean=None, std=None):
         x = x - x_mean.unsqueeze(0)
         x = x / (x_std.unsqueeze(0) + 1e-12)
     return x, x_mean, x_std
+
+
+def load_jsonl_as_dataset(jsonl_path: str, max_samples: int = 0):
+    """Load a local JSONL file into a HF Dataset, preserving file order.
+
+    This matches truthful_qa/annotate_llamacpp.py's behavior (read line-by-line json.loads).
+
+    Args:
+        jsonl_path: Path to a .jsonl file.
+        max_samples: If >0, stop after this many rows.
+    """
+    import os
+    import json
+
+    if not os.path.exists(jsonl_path):
+        raise FileNotFoundError(f"JSONL not found: {jsonl_path}")
+
+    rows = []
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+            if max_samples and max_samples > 0 and len(rows) >= int(max_samples):
+                break
+
+    if len(rows) == 0:
+        raise ValueError(f"No rows found in JSONL: {jsonl_path}")
+
+    # Lazy import to avoid making `datasets` a hard dependency for every utils consumer.
+    from datasets import Dataset
+
+    return Dataset.from_list(rows)
