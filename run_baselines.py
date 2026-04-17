@@ -71,6 +71,9 @@ def run_single_method(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     steer_label = build_steer_name(steer_name, steer_model_kwargs, T)
+    if steer_name == "PaCE" and pace_cfg is not None:
+        reuse_suffix = "reuseCoeff" if bool(pace_cfg.get("reuse_coeff_across_tokens", False)) else "noReuseCoeff"
+        steer_label = f"{steer_label}-{reuse_suffix}"
     filename = f"{model_name}-l{layer_idx}-{steer_label}-TruthfulQA-seed{seed}.jsonl"
 
     if (output_dir / filename).exists():
