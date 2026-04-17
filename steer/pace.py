@@ -21,9 +21,9 @@ How this file works
 4. **PaCESteerer** — Registers a **forward hook** on that transformer block. On
    each forward, for every token position it expresses the hidden state as a
    linear mix of concept vectors (`decompose_sparse`: SVD-reduced least squares),
-   rebuilds only the **undesirable** part of that mix, and **subtracts** it
-   (scaled by `alpha`) from the activation — suppressing those directions in
-   residual space.
+    computes a residual and a masked intervention coefficient vector, then
+    reconstructs as ``z_new = (z - D c) + D c_masked`` where undesirable
+    coefficients are scaled by ``(1 - alpha)``.
 
 Dictionary math stays on **CPU** (NumPy `lstsq`) unless ``pace_gpu`` is set; either
 way the cost is dominated by **one full-dictionary** SVD + least-squares per
@@ -348,6 +348,9 @@ class PaCESteerer:
         alpha (float), layer_idx (int)
         pace_gpu (bool): run decompose_sparse on GPU (still expensive: full-dict SVD/lstsq per token).
         pace_token_timing (bool): print per-(batch, seq) position timing for each hook call (verbose).
+        reuse_coeff_across_tokens (bool): if True, decompose only once on the first
+            seen token and reuse that coefficient vector for all later tokens while
+            this hook is registered.
     """
 
     def __init__(self, cfg: dict, model: nn.Module, tokenizer):
@@ -358,7 +361,11 @@ class PaCESteerer:
         self._hook_handle = None
         self.pace_gpu: bool = bool(cfg.get("pace_gpu", False))
         self.pace_token_timing: bool = bool(cfg.get("pace_token_timing", False))
+        self.reuse_coeff_across_tokens: bool = bool(cfg.get("reuse_coeff_across_tokens", False))
         self._timing_token_idx: int = 0
+        self._cached_recon_device: Optional[torch.device] = None
+        self._cached_recon_base: Optional[torch.Tensor] = None
+        self._cached_recon_intervened: Optional[torch.Tensor] = None
 
         concept_dict = ConceptDictionary(
             index_path=cfg["index_path"],
@@ -383,9 +390,101 @@ class PaCESteerer:
         )
 
         self.alpha: float = cfg.get("alpha", 1.0)
+        self._concept_matrix_cpu: Optional[torch.Tensor] = None
+        self._undesirable_mask_cpu: Optional[torch.Tensor] = None
+        if self.concept_vectors:
+            self._concept_matrix_cpu = torch.stack(self.concept_vectors, dim=0).to(dtype=torch.float32)
+            self._undesirable_mask_cpu = torch.zeros(len(self.concept_vectors), dtype=torch.float32)
+            if self.undesirable_idx:
+                self._undesirable_mask_cpu[self.undesirable_idx] = 1.0
+
         self._concept_vectors_gpu: Optional[List[torch.Tensor]] = None
+        self._concept_matrix_gpu: Optional[torch.Tensor] = None
+        self._undesirable_mask_gpu: Optional[torch.Tensor] = None
         if self.pace_gpu:
             self._concept_vectors_gpu = []
+
+    def _reset_cached_reconstruction(self):
+        self._cached_recon_device = None
+        self._cached_recon_base = None
+        self._cached_recon_intervened = None
+
+    def _ensure_gpu_concepts(self, dev: torch.device):
+        if not self.pace_gpu:
+            return
+        if self._concept_vectors_gpu is None or len(self._concept_vectors_gpu) != len(self.concept_vectors):
+            self._concept_vectors_gpu = []
+        if len(self._concept_vectors_gpu) == 0 or self._concept_vectors_gpu[0].device != dev:
+            self._concept_vectors_gpu = [v.to(device=dev, dtype=torch.float32) for v in self.concept_vectors]
+            self._concept_matrix_gpu = None
+            self._undesirable_mask_gpu = None
+        if self._concept_matrix_gpu is None and self._concept_vectors_gpu:
+            self._concept_matrix_gpu = torch.stack(self._concept_vectors_gpu, dim=0)
+        if self._undesirable_mask_gpu is None and self._concept_vectors_gpu:
+            self._undesirable_mask_gpu = torch.zeros(len(self._concept_vectors_gpu), device=dev, dtype=torch.float32)
+            if self.undesirable_idx:
+                self._undesirable_mask_gpu[self.undesirable_idx] = 1.0
+
+    def _compute_coeffs(
+        self,
+        activation: torch.Tensor,
+        profile: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, dict]]:
+        use_gpu = self.pace_gpu
+        if use_gpu:
+            self._ensure_gpu_concepts(activation.device)
+            target = activation.detach().float()
+            dictionary = self._concept_vectors_gpu or []
+        else:
+            target = activation.detach().float().cpu()
+            dictionary = self.concept_vectors
+
+        return decompose_sparse(
+            target=target,
+            dictionary=dictionary,
+            normalize=True,
+            use_gpu=use_gpu,
+            return_timings=profile,
+        )
+
+    def _reconstruct_from_coeffs(
+        self,
+        coeffs: torch.Tensor,
+        dev: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.pace_gpu:
+            self._ensure_gpu_concepts(dev)
+            C = self._concept_matrix_gpu
+            mask = self._undesirable_mask_gpu
+            coeffs_dev = coeffs.to(device=dev, dtype=torch.float32)
+        else:
+            C = self._concept_matrix_cpu
+            mask = self._undesirable_mask_cpu
+            coeffs_dev = coeffs.to(device="cpu", dtype=torch.float32)
+
+        if C is None or mask is None:
+            zero = torch.zeros_like(coeffs_dev)
+            return zero, zero
+
+        base = coeffs_dev @ C
+        coeffs_masked = coeffs_dev - (self.alpha * mask * coeffs_dev)
+        intervened = coeffs_masked @ C
+        return base, intervened
+
+    def _apply_reconstruction(
+        self,
+        activation: torch.Tensor,
+        base: torch.Tensor,
+        intervened: torch.Tensor,
+    ) -> torch.Tensor:
+        dev, dtype = activation.device, activation.dtype
+        if base.device != dev:
+            base = base.to(device=dev)
+        if intervened.device != dev:
+            intervened = intervened.to(device=dev)
+        residual = activation.detach().float() - base
+        out = residual + intervened
+        return out.to(dtype=dtype)
 
     def fit(self, *args, **kwargs):
         return self
@@ -401,94 +500,56 @@ class PaCESteerer:
             return activation
 
         t_steer0 = time.perf_counter()
-        dev, dtype = activation.device, activation.dtype
-        if self.pace_gpu:
-            if self._concept_vectors_gpu is None or len(self._concept_vectors_gpu) != len(self.concept_vectors):
-                self._concept_vectors_gpu = []
-            if len(self._concept_vectors_gpu) == 0 or self._concept_vectors_gpu[0].device != dev:
-                self._concept_vectors_gpu = [v.to(device=dev, dtype=torch.float32) for v in self.concept_vectors]
+        dev = activation.device
 
+        if (
+            self.reuse_coeff_across_tokens
+            and self._cached_recon_device == dev
+            and self._cached_recon_base is not None
+            and self._cached_recon_intervened is not None
+        ):
             t0 = time.perf_counter()
-            act_gpu = activation.detach().float()
-            t_prep = time.perf_counter() - t0
-
-            if profile:
-                dec = decompose_sparse(
-                    target=act_gpu,
-                    dictionary=self._concept_vectors_gpu,
-                    normalize=True,
-                    use_gpu=True,
-                    return_timings=True,
-                )
-                coeffs, dec_tim = dec  # type: ignore[misc]
-            else:
-                coeffs = decompose_sparse(
-                    target=act_gpu,
-                    dictionary=self._concept_vectors_gpu,
-                    normalize=True,
-                    use_gpu=True,
-                )
-
-            t0 = time.perf_counter()
-            correction = torch.zeros_like(act_gpu)
-            for idx in self.undesirable_idx:
-                if idx < len(coeffs):
-                    correction += coeffs[idx] * self._concept_vectors_gpu[idx]
-            t_corr = time.perf_counter() - t0
-
-            steered = act_gpu - self.alpha * correction
-            t0 = time.perf_counter()
-            out = steered.to(dtype=dtype)
-            t_cast = time.perf_counter() - t0
+            out = self._apply_reconstruction(activation, self._cached_recon_base, self._cached_recon_intervened)
+            t_apply = time.perf_counter() - t0
             t_steer = time.perf_counter() - t_steer0
-
             if profile:
-                prof: dict = {
-                    "prep_s": t_prep,
-                    "correction_s": t_corr,
-                    "to_dtype_s": t_cast,
+                return out, {
+                    "reuse_cached_coeff": True,
+                    "apply_reconstruction_s": t_apply,
                     "steer_total_s": t_steer,
                     "n_concepts": len(self.concept_vectors),
                     "n_undesirable": len(self.undesirable_idx),
                 }
-                prof.update(dec_tim)
-                return out, prof
             return out
 
-        # CPU reference path.
         t0 = time.perf_counter()
-        act_cpu = activation.detach().float().cpu()
-        t_prep = time.perf_counter() - t0
-
+        dec = self._compute_coeffs(activation, profile=profile)
+        t_decompose = time.perf_counter() - t0
         if profile:
-            dec = decompose_sparse(
-                target=act_cpu, dictionary=self.concept_vectors, normalize=True,
-                return_timings=True,
-            )
             coeffs, dec_tim = dec  # type: ignore[misc]
         else:
-            coeffs = decompose_sparse(
-                target=act_cpu, dictionary=self.concept_vectors, normalize=True,
-            )
+            coeffs = dec  # type: ignore[assignment]
 
         t0 = time.perf_counter()
-        correction = torch.zeros_like(act_cpu)
-        for idx in self.undesirable_idx:
-            if idx < len(coeffs):
-                correction += coeffs[idx] * self.concept_vectors[idx]
-        t_corr = time.perf_counter() - t0
+        base, intervened = self._reconstruct_from_coeffs(coeffs, dev=dev)
+        t_recon = time.perf_counter() - t0
 
-        steered = act_cpu - self.alpha * correction
+        if self.reuse_coeff_across_tokens:
+            self._cached_recon_device = dev
+            self._cached_recon_base = base.detach()
+            self._cached_recon_intervened = intervened.detach()
+
         t0 = time.perf_counter()
-        out = steered.to(device=dev, dtype=dtype)
-        t_cast = time.perf_counter() - t0
+        out = self._apply_reconstruction(activation, base, intervened)
+        t_apply = time.perf_counter() - t0
         t_steer = time.perf_counter() - t_steer0
 
         if profile:
-            prof = {
-                "prep_s": t_prep,
-                "correction_s": t_corr,
-                "to_dtype_s": t_cast,
+            prof: dict = {
+                "reuse_cached_coeff": False,
+                "decompose_call_s": t_decompose,
+                "reconstruct_s": t_recon,
+                "apply_reconstruction_s": t_apply,
                 "steer_total_s": t_steer,
                 "n_concepts": len(self.concept_vectors),
                 "n_undesirable": len(self.undesirable_idx),
@@ -521,12 +582,14 @@ class PaCESteerer:
                     print(
                         f"[PaCE timing] i={idx} b={b} t={t} "
                         f"n_concepts={prof.get('n_concepts', '?')} n_undesirable={prof.get('n_undesirable', '?')} "
+                        f"reuse_cached={prof.get('reuse_cached_coeff', False)} "
                         f"prep_ms={_ms(prof.get('prep_s', 0)):.2f} "
                         f"stack_embed_ms={_ms(prof.get('stack_embed_s', 0)):.2f} "
                         f"svd_ms={_ms(prof.get('svd_s', prof.get('stack_svd_s', 0))):.2f} "
                         f"norm_ms={_ms(prof.get('norm_s', 0)):.2f} "
                         f"lstsq_ms={_ms(prof.get('lstsq_s', prof.get('lstsq_np_s', 0))):.2f} "
-                        f"correction_ms={_ms(prof.get('correction_s', 0)):.2f} "
+                        f"reconstruct_ms={_ms(prof.get('reconstruct_s', 0)):.2f} "
+                        f"apply_ms={_ms(prof.get('apply_reconstruction_s', 0)):.2f} "
                         f"to_dtype_ms={_ms(prof.get('to_dtype_s', 0)):.2f} "
                         f"decompose_total_ms={dec_ms:.2f} steer_total_ms={_ms(prof.get('steer_total_s', 0)):.2f} "
                         f"token_wall_ms={_ms(t_tok):.2f}",
@@ -549,6 +612,8 @@ class PaCESteerer:
         return steered
 
     def register_hook(self):
+        self._reset_cached_reconstruction()
+        self._timing_token_idx = 0
         layer = self._get_layer(self.layer_idx)
         self._hook_handle = layer.register_forward_hook(self._hook_fn)
 
@@ -556,6 +621,7 @@ class PaCESteerer:
         if self._hook_handle is not None:
             self._hook_handle.remove()
             self._hook_handle = None
+        self._reset_cached_reconstruction()
 
     def _get_layer(self, idx: int) -> nn.Module:
         model = self.model
