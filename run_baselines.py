@@ -165,6 +165,7 @@ def build_pace_cfg(layer_idx: int, args) -> dict:
         "layer_idx": layer_idx,
         "pace_gpu": args.pace_gpu,
         "pace_token_timing": args.pace_token_timing,
+        "reuse_coeff_across_tokens": args.pace_reuse_coeff_across_tokens,
     }
 
 
@@ -194,6 +195,11 @@ def main():
                         help="Run PaCE sparse decomposition on GPU (faster, may slightly change outputs).")
     parser.add_argument("--pace_token_timing", action="store_true",
                         help="Print per (batch, seq) position PaCE timings during generation (verbose).")
+    parser.add_argument(
+        "--pace_reuse_coeff_across_tokens",
+        action="store_true",
+        help="Enable PaCE coefficient reuse across tokens (faster; may affect steering behavior).",
+    )
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir) if args.data_dir else None
