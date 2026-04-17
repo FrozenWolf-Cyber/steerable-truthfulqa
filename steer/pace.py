@@ -570,33 +570,68 @@ class PaCESteerer:
         t_clone = time.perf_counter() - t_hook0
 
         for b in range(B):
+            if self.pace_token_timing:
+                t_batch0 = time.perf_counter()
+                prep_s = 0.0
+                stack_embed_s = 0.0
+                svd_s = 0.0
+                norm_s = 0.0
+                lstsq_s = 0.0
+                reconstruct_s = 0.0
+                apply_s = 0.0
+                to_dtype_s = 0.0
+                decompose_total_s = 0.0
+                steer_total_s = 0.0
+                token_wall_s = 0.0
+                reuse_cached_count = 0
+                n_concepts = "?"
+                n_undesirable = "?"
+
             for t in range(T):
                 if self.pace_token_timing:
                     t_tok0 = time.perf_counter()
                     out, prof = self._steer_activation(hidden[b, t], profile=True)  # type: ignore[misc]
                     steered[b, t] = out
                     t_tok = time.perf_counter() - t_tok0
-                    idx = self._timing_token_idx
-                    self._timing_token_idx += 1
-                    dec_ms = _ms(prof.get("decompose_total_s", prof.get("steer_total_s", 0.0)))
-                    print(
-                        f"[PaCE timing] i={idx} b={b} t={t} "
-                        f"n_concepts={prof.get('n_concepts', '?')} n_undesirable={prof.get('n_undesirable', '?')} "
-                        f"reuse_cached={prof.get('reuse_cached_coeff', False)} "
-                        f"prep_ms={_ms(prof.get('prep_s', 0)):.2f} "
-                        f"stack_embed_ms={_ms(prof.get('stack_embed_s', 0)):.2f} "
-                        f"svd_ms={_ms(prof.get('svd_s', prof.get('stack_svd_s', 0))):.2f} "
-                        f"norm_ms={_ms(prof.get('norm_s', 0)):.2f} "
-                        f"lstsq_ms={_ms(prof.get('lstsq_s', prof.get('lstsq_np_s', 0))):.2f} "
-                        f"reconstruct_ms={_ms(prof.get('reconstruct_s', 0)):.2f} "
-                        f"apply_ms={_ms(prof.get('apply_reconstruction_s', 0)):.2f} "
-                        f"to_dtype_ms={_ms(prof.get('to_dtype_s', 0)):.2f} "
-                        f"decompose_total_ms={dec_ms:.2f} steer_total_ms={_ms(prof.get('steer_total_s', 0)):.2f} "
-                        f"token_wall_ms={_ms(t_tok):.2f}",
-                        flush=True,
-                    )
+                    prep_s += float(prof.get("prep_s", 0.0))
+                    stack_embed_s += float(prof.get("stack_embed_s", 0.0))
+                    svd_s += float(prof.get("svd_s", prof.get("stack_svd_s", 0.0)))
+                    norm_s += float(prof.get("norm_s", 0.0))
+                    lstsq_s += float(prof.get("lstsq_s", prof.get("lstsq_np_s", 0.0)))
+                    reconstruct_s += float(prof.get("reconstruct_s", 0.0))
+                    apply_s += float(prof.get("apply_reconstruction_s", 0.0))
+                    to_dtype_s += float(prof.get("to_dtype_s", 0.0))
+                    decompose_total_s += float(prof.get("decompose_total_s", prof.get("steer_total_s", 0.0)))
+                    steer_total_s += float(prof.get("steer_total_s", 0.0))
+                    token_wall_s += t_tok
+                    reuse_cached_count += int(bool(prof.get("reuse_cached_coeff", False)))
+                    n_concepts = prof.get("n_concepts", "?")
+                    n_undesirable = prof.get("n_undesirable", "?")
                 else:
                     steered[b, t] = self._steer_activation(hidden[b, t])  # type: ignore[assignment]
+
+            if self.pace_token_timing:
+                idx = self._timing_token_idx
+                self._timing_token_idx += 1
+                t_batch = time.perf_counter() - t_batch0
+                print(
+                    f"[PaCE timing] i={idx} b={b} T={T} "
+                    f"n_concepts={n_concepts} n_undesirable={n_undesirable} "
+                    f"reuse_cached={reuse_cached_count}/{T} "
+                    f"prep_ms={_ms(prep_s):.2f} "
+                    f"stack_embed_ms={_ms(stack_embed_s):.2f} "
+                    f"svd_ms={_ms(svd_s):.2f} "
+                    f"norm_ms={_ms(norm_s):.2f} "
+                    f"lstsq_ms={_ms(lstsq_s):.2f} "
+                    f"reconstruct_ms={_ms(reconstruct_s):.2f} "
+                    f"apply_ms={_ms(apply_s):.2f} "
+                    f"to_dtype_ms={_ms(to_dtype_s):.2f} "
+                    f"decompose_total_ms={_ms(decompose_total_s):.2f} "
+                    f"steer_total_ms={_ms(steer_total_s):.2f} "
+                    f"token_wall_ms={_ms(token_wall_s):.2f} "
+                    f"batch_wall_ms={_ms(t_batch):.2f}",
+                    flush=True,
+                )
 
         if self.pace_token_timing:
             t_hook = time.perf_counter() - t_hook0
