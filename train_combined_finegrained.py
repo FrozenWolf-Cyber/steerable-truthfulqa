@@ -37,6 +37,7 @@ from eval_metrics import (
     load_reward_model,
     run_rm_metrics,
     run_steerability_llamacpp_judge,
+    run_truthfulqa_evaluation_for_cbm,
 )
 import wandb
 
@@ -219,6 +220,53 @@ parser.add_argument(
     type=float,
     default=0.1,
     help="Temperature for llama.cpp steerability judge.",
+)
+parser.add_argument(
+    "--skip_truthfulqa_final_test",
+    action="store_true",
+    help="Skip final TruthfulQA generation + judge evaluation.",
+)
+parser.add_argument(
+    "--truthfulqa_data_dir",
+    type=str,
+    default="",
+    help="Optional TruthfulQA data directory override.",
+)
+parser.add_argument(
+    "--truthfulqa_results_root",
+    type=str,
+    default="",
+    help="Optional root directory for TruthfulQA raw outputs and eval CSV.",
+)
+parser.add_argument(
+    "--truthfulqa_max_new_tokens",
+    type=int,
+    default=50,
+    help="Max new tokens for final TruthfulQA generation.",
+)
+parser.add_argument(
+    "--truthfulqa_temperature",
+    type=float,
+    default=0.7,
+    help="Sampling temperature for final TruthfulQA generation.",
+)
+parser.add_argument(
+    "--truthfulqa_top_p",
+    type=float,
+    default=0.9,
+    help="Top-p for final TruthfulQA generation.",
+)
+parser.add_argument(
+    "--truthfulqa_top_k",
+    type=int,
+    default=100,
+    help="Top-k for final TruthfulQA generation.",
+)
+parser.add_argument(
+    "--truthfulqa_repetition_penalty",
+    type=float,
+    default=1.1,
+    help="Repetition penalty for final TruthfulQA generation.",
 )
 
 
@@ -732,6 +780,39 @@ if __name__ == "__main__":
 
     # ── Weight analysis ──
     run_weight_analysis(cbl, concept_set, tokenizer)
+
+    # ── Final test: TruthfulQA generation + judge evaluation ──
+    if not args.skip_truthfulqa_final_test:
+        try:
+            print("Running final TruthfulQA evaluation...")
+            run_truthfulqa_evaluation_for_cbm(
+                preLM=preLM,
+                cbl=cbl,
+                tokenizer=tokenizer,
+                concept_set=concept_set,
+                seed=args.seed,
+                batch_size=args.batch_size,
+                model_label=f"CBM-Llama3-{args.dataset}",
+                layer_idx=best_epoch,
+                run_id=run_name,
+                use_class_concepts=args.use_class_concepts,
+                intervention_goals=None,
+                intervention_value=float(intervention_value),
+                keep_other_concepts=args.intervention_keep_other_concepts,
+                max_new_tokens=args.truthfulqa_max_new_tokens,
+                temperature=args.truthfulqa_temperature,
+                top_p=args.truthfulqa_top_p,
+                top_k=args.truthfulqa_top_k,
+                repetition_penalty=args.truthfulqa_repetition_penalty,
+                data_dir=(args.truthfulqa_data_dir or None),
+                results_root=(args.truthfulqa_results_root or None),
+                llama_vocab_weight=llama_vocab_weight,
+                display=not args.DEBUG,
+            )
+        except Exception as truthfulqa_err:
+            print(f"TruthfulQA final testing failed (non-fatal): {truthfulqa_err}")
+    else:
+        print("Skipping final TruthfulQA testing.")
 
     # ── Free model from GPU ──
     del preLM, cbl
