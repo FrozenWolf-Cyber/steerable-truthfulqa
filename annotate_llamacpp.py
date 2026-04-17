@@ -12,6 +12,12 @@ from llama_cpp import Llama
 def parse_args():
     p = argparse.ArgumentParser(description="FEVER concept annotation with llama.cpp")
     p.add_argument("--restart", action="store_true")
+    p.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="Optional cap for FEVER train samples. Default: no cap.",
+    )
     p.add_argument("--n-ctx", type=int, default=2048)
     p.add_argument("--max-tokens", type=int, default=128,
                    help="128 is plenty for a single label line.")
@@ -25,7 +31,7 @@ ARGS = parse_args()
 MODEL_REPO_ID = "unsloth/Qwen3.5-27B-GGUF"
 MODEL_FILENAME = "Qwen3.5-27B-Q8_0.gguf"
 CHECKPOINT_PATH = "fever_progress_llamacpp.pkl"
-MAX_SAMPLES = 20000
+MAX_SAMPLES = ARGS.max_samples
 
 if ARGS.restart and os.path.isfile(CHECKPOINT_PATH):
     os.remove(CHECKPOINT_PATH)
@@ -203,7 +209,8 @@ def run_dataset(dataset_name, dataset_url, local_path, checkpoint_path,
     all_vectors, all_claims, all_labels = [], [], []
     all_prompts, all_outputs_raw, all_parse_errors = [], [], []
 
-    try:
+    resumed_from = None
+    if os.path.isfile(checkpoint_path):
         with open(checkpoint_path, "rb") as f:
             ckpt = pickle.load(f)
         all_vectors      = ckpt.get("all_vectors", [])
@@ -212,13 +219,67 @@ def run_dataset(dataset_name, dataset_url, local_path, checkpoint_path,
         all_prompts      = ckpt.get("all_prompts", [])
         all_outputs_raw  = ckpt.get("all_outputs_raw", ckpt.get("all_outputs", []))
         all_parse_errors = ckpt.get("all_parse_errors", [])
-        if len(all_prompts) < len(all_claims):
-            all_prompts = (all_prompts + [""] * len(all_claims))[:len(all_claims)]
-        print(f"[{dataset_name}] Resuming: {len(all_claims)} already done.")
-    except FileNotFoundError:
+        resumed_from = "checkpoint"
+    else:
+        # Fallback: if checkpoint is missing, recover progress from previous outputs
+        # so reruns continue from the last completed index (e.g., 20k cap run).
+        raw_json_path = f"{output_prefix}_raw_outputs_llamacpp.json"
+        claims_npy_path = f"{output_prefix}_claims_llamacpp.npy"
+        vectors_npy_path = f"{output_prefix}_concept_vectors_llamacpp.npy"
+
+        if os.path.isfile(raw_json_path):
+            with open(raw_json_path, "r") as f:
+                prev = json.load(f)
+            all_claims = list(prev.get("claims", []))
+            all_labels = list(prev.get("fever_labels", []))
+            all_prompts = list(prev.get("prompts", []))
+            all_outputs_raw = list(prev.get("outputs_raw", prev.get("all_outputs", [])))
+            all_parse_errors = list(prev.get("parse_errors", []))
+            resumed_from = "raw_outputs_json"
+        elif os.path.isfile(claims_npy_path):
+            all_claims = np.load(claims_npy_path, allow_pickle=True).tolist()
+            all_labels = ["NOT ENOUGH INFO"] * len(all_claims)
+            all_prompts = [""] * len(all_claims)
+            all_outputs_raw = [""] * len(all_claims)
+            all_parse_errors = [""] * len(all_claims)
+            resumed_from = "claims_npy"
+
+        if os.path.isfile(vectors_npy_path):
+            prev_vecs = np.load(vectors_npy_path, allow_pickle=True)
+            all_vectors = [v for v in prev_vecs]
+            if resumed_from is None:
+                resumed_from = "vectors_npy"
+
+    if resumed_from is not None:
+        # Align lengths defensively in case files were written from different runs.
+        lengths = [
+            len(all_claims),
+            len(all_labels),
+            len(all_prompts),
+            len(all_outputs_raw),
+            len(all_parse_errors),
+        ]
+        if all_vectors:
+            lengths.append(len(all_vectors))
+        n = min(lengths) if lengths else 0
+
+        all_claims = all_claims[:n]
+        all_labels = all_labels[:n]
+        all_prompts = all_prompts[:n]
+        all_outputs_raw = all_outputs_raw[:n]
+        all_parse_errors = all_parse_errors[:n]
+        all_vectors = all_vectors[:n] if all_vectors else []
+        print(f"[{dataset_name}] Resuming from {resumed_from}: {n} already done.")
+    else:
         print(f"[{dataset_name}] Starting fresh.")
 
     start_idx = len(all_claims)
+    if start_idx > len(dataset):
+        print(
+            f"[{dataset_name}] Saved progress ({start_idx}) exceeds dataset size ({len(dataset)}). "
+            f"Clamping to dataset size."
+        )
+        start_idx = len(dataset)
 
     for i, ex in enumerate(
         tqdm(dataset[start_idx:], initial=start_idx, total=len(dataset), desc=dataset_name)
